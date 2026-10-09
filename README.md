@@ -27,4 +27,4 @@ A lightweight, open-source Windows App Installer & System Tweak Tool inspired by
 Run the following command in PowerShell as an Administrator:
 
 ```powershell
-irm [https://raw.githubusercontent.com/MR-X905-dev/STweak/refs/heads/main/STweak.ps1](https://raw.githubusercontent.com/MR-X905-dev/STweak/refs/heads/main/STweak.ps1) | iex
+irm https://raw.githubusercontent.com/MR-X905-dev/STweak/refs/heads/main/STweak.ps1 | iex
