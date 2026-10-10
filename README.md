@@ -28,8 +28,6 @@ Run the following command in PowerShell as an Administrator:
 
 ```powershell
 irm https://raw.githubusercontent.com/MR-X905-dev/STweak/main/dev/dev-STweak.ps1 | iex
-
-
 ```
 
 
