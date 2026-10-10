@@ -1,6 +1,6 @@
 #Requires -RunAsAdministrator
 <#
-    ShadowTweak - Windows App Installer, System Tweaks & Full Uninstaller
+    STwaek - Windows App Installer, System Tweaks & Full Uninstaller
     Inspired by Chris Titus Tech's WinUtil (https://christitus.com/win)
 
     Design notes (read this if you're auditing the code):
@@ -36,9 +36,9 @@ Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
 
 # ============================================================================
-# Paths / action log
+# Paths / action log "
 # ============================================================================
-$LogDir  = Join-Path $env:ProgramData "ShadowTweak"
+$LogDir  = Join-Path $env:ProgramData "STwaek"
 $LogFile = Join-Path $LogDir "actions.json"
 
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
@@ -813,7 +813,7 @@ function Invoke-UninstallCommand {
 [xml]$Xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="ShadowTweak - App Installer, System Tweaks, Uninstaller &amp; Security"
+        Title="STwaek - App Installer, System Tweaks, Uninstaller &amp; Security"
         Height="780" Width="1040" WindowStartupLocation="CenterScreen"
         Background="#1e1e1e">
     <Window.Resources>
@@ -837,7 +837,7 @@ function Invoke-UninstallCommand {
         </Style>
     </Window.Resources>
     <DockPanel>
-        <TextBlock DockPanel.Dock="Top" Text="ShadowTweak" FontSize="22" FontWeight="Bold"
+        <TextBlock DockPanel.Dock="Top" Text="STwaek" FontSize="22" FontWeight="Bold"
                    Foreground="#4FC3F7" Margin="12,10,0,0"/>
         <TextBlock DockPanel.Dock="Top" Text="App installer + reversible system tweaks + full uninstaller + Windows Defender scan (no remote access feature)"
                    FontSize="11" Foreground="#AAAAAA" Margin="12,0,0,4" TextWrapping="Wrap"/>
@@ -1387,7 +1387,7 @@ $BtnUndo.Add_Click({
 
     if (-not $dry) {
         $confirm = [System.Windows.MessageBox]::Show(
-            "This will uninstall every app ShadowTweak installed and restore every tweak ShadowTweak applied back to its exact previous value. It will NOT touch anything else on the system. Anything that cannot be undone successfully stays in the action log so you can retry. Continue?",
+            "This will uninstall every app STwaek installed and restore every tweak STwaek applied back to its exact previous value. It will NOT touch anything else on the system. Anything that cannot be undone successfully stays in the action log so you can retry. Continue?",
             "Undo Everything This Tool Did", "YesNo", "Warning")
         if ($confirm -ne "Yes") { return }
     }
@@ -1472,7 +1472,7 @@ $BtnUndo.Add_Click({
     else { Write-Log "Undo finished, but $kept item(s) could not be reverted and remain in the action log. Run Undo again after fixing the problem." }
 })
 
-Write-Log "ShadowTweak ready. $($AppCatalog.Count) apps and $($TweakCatalog.Count) tweaks loaded."
+Write-Log "STwaek ready. $($AppCatalog.Count) apps and $($TweakCatalog.Count) tweaks loaded."
 Write-Log "Action log stored at: $LogFile"
 Write-Log "Dry Run is ON by default. Uncheck 'Dry Run' at the bottom to make real changes."
 
