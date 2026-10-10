@@ -28,3 +28,19 @@ Run the following command in PowerShell as an Administrator:
 
 ```powershell
 irm https://raw.githubusercontent.com/MR-X905-dev/STweak/refs/heads/main/STweak.ps1 | iex
+
+
+```
+
+
+## 🧪 Run the Beta Version
+
+Want to try the latest experimental features? Run the following command in PowerShell as an Administrator:
+
+```powershell
+irm https://raw.githubusercontent.com/MR-X905-dev/STweak/refs/heads/beta/STweak.ps1 | iex
+```
+
+> ⚠️ **Beta Warning:** This version may contain bugs, incomplete features, or unexpected behavior. Use it at your own risk and review the script before running it.
+
+
