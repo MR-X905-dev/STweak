@@ -41,7 +41,6 @@ Add-Type -AssemblyName WindowsBase
 $LogDir  = Join-Path $env:ProgramData "STwaek"
 $LogFile = Join-Path $LogDir "actions.json"
 
-if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
 $QuarantineDir = Join-Path $LogDir "Quarantine"
 
 function Write-LogSafe($Text) {
@@ -70,8 +69,10 @@ function Get-ActionLog {
             return $obj
         } catch {
             $aside = "$candidate.corrupt-" + (Get-Date -Format "yyyyMMdd-HHmmss")
-            try { Copy-Item -LiteralPath $candidate -Destination $aside -ErrorAction Stop } catch { }
-            Write-LogSafe "WARNING: could not read $candidate ($($_.Exception.Message)). A copy was kept at $aside"
+            if (-not (Test-DryRun)) {
+                try { Copy-Item -LiteralPath $candidate -Destination $aside -ErrorAction Stop } catch { $aside = "backup copy failed" }
+            } else { $aside = "copy suppressed in Dry Run" }
+            Write-LogSafe "WARNING: could not read $candidate ($($_.Exception.Message)); $aside"
         }
     }
     return (New-EmptyActionLog)
@@ -81,6 +82,7 @@ function Get-ActionLog {
 # (keeping the previous version as .bak). A crash mid-write can no longer
 # leave a half-written action log.
 function Save-ActionLog($log) {
+    if (-not (Test-Path -LiteralPath $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force -ErrorAction Stop | Out-Null }
     $log | Add-Member -NotePropertyName schemaVersion -NotePropertyValue 2 -Force
     $tmp = "$LogFile.tmp"
     $json = $log | ConvertTo-Json -Depth 8
@@ -93,7 +95,7 @@ function Save-ActionLog($log) {
     }
 }
 
-if (-not (Test-Path -LiteralPath $LogFile)) { Save-ActionLog (New-EmptyActionLog) }
+# The action log is created lazily only when a real action needs to save state.
 
 # True while the "Dry Run" checkbox is checked. $ChkDryRun is created later
 # when the window is built; this is only evaluated at click time.
@@ -487,10 +489,15 @@ $TweakCatalog = @(
             $path = "HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32"
             $existed = Test-Path $path
             $prevDefault = $null
+            $defaultValueExisted = $false
             if ($existed) {
-                try { $prevDefault = (Get-Item -LiteralPath $path).GetValue("") } catch { }
+                try {
+                    $key = Get-Item -LiteralPath $path -ErrorAction Stop
+                    $defaultValueExisted = ($key.GetValueNames() -contains '')
+                    if ($defaultValueExisted) { $prevDefault = $key.GetValue('') }
+                } catch { }
             }
-            @{ Existed = $existed; PrevDefaultValue = $prevDefault }
+            @{ Existed = $existed; DefaultValueExisted = $defaultValueExisted; PrevDefaultValue = $prevDefault }
         }
         Plan = {
             param($State)
@@ -498,8 +505,9 @@ $TweakCatalog = @(
             "REGISTRY key HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32 (already exists: $($State.Existed)) -> would be created/set with an empty (default) value"
         }
         Apply = {
-            New-Item -Path "HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32" -Force | Out-Null
-            Set-ItemProperty -Path "HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32" -Name "(default)" -Value "" -Type String
+            $path = "HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32"
+            New-Item -Path $path -Force | Out-Null
+            Set-Item -LiteralPath $path -Value ''
             return $null
         }
         Restore = {
@@ -509,12 +517,28 @@ $TweakCatalog = @(
                 Remove-Item -Path "HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}" -Recurse -Force -ErrorAction SilentlyContinue
             } else {
                 $path = "HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32"
-                $val = if ($null -ne $State.PrevDefaultValue) { $State.PrevDefaultValue } else { "" }
-                if (Test-Path $path) { Set-ItemProperty -Path $path -Name "(default)" -Value $val -Type String }
+                if (Test-Path $path) {
+                    if ($State.DefaultValueExisted) { Set-Item -LiteralPath $path -Value ([string]$State.PrevDefaultValue) }
+                    else {
+                        try {
+                            $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32', $true)
+                            if ($key) { $key.DeleteValue('', $false); $key.Close() }
+                        } catch { throw }
+                    }
+                }
             }
         }
     }
 )
+
+# Categorize tweaks for profiles. Profiles only select checkboxes; they never apply changes.
+function Get-TweakCategory([string]$Key) {
+    $routine = @('ShowFileExtensions','ShowHiddenFiles','ShowThisPCOnDesktop','DarkMode','AlignTaskbarLeft','ClassicRightClickMenu','DisableStickyKeysPrompt')
+    $performance = @('DisableGameBar','DisableBackgroundApps','DisableFastStartup','DisableStartupDelay','DisableSysMain','DisableHibernation','UltimatePerformancePlan')
+    if ($routine -contains $Key) { return 'اعتيادي' }
+    if ($performance -contains $Key) { return 'أداء' }
+    return 'متقدم'
+}
 
 # ============================================================================
 # Uninstall tab: enumerate installed programs, run their real uninstaller,
@@ -841,7 +865,7 @@ function Invoke-UninstallCommand {
                    Foreground="#4FC3F7" Margin="12,10,0,0"/>
         <TextBlock DockPanel.Dock="Top" Text="App installer + reversible system tweaks + full uninstaller + Windows Defender scan (no remote access feature)"
                    FontSize="11" Foreground="#AAAAAA" Margin="12,0,0,4" TextWrapping="Wrap"/>
-        <TextBlock Name="TxtDryRunBanner" DockPanel.Dock="Top" Text="DRY RUN is ON - nothing will be changed. Actions only print what they WOULD do in the Log tab."
+        <TextBlock Name="TxtDryRunBanner" DockPanel.Dock="Top" Text="DRY RUN is ON - nothing will be changed. Actions only print what they WOULD do in the Log tab; no action log is created or changed."
                    FontSize="12" FontWeight="Bold" Foreground="#FFD54F" Margin="12,0,0,8" TextWrapping="Wrap"/>
 
         <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,8,0,10">
@@ -949,7 +973,7 @@ function Write-Log {
 # Dry Run toggle: updates the banner and tells the user which mode is active.
 function Update-DryRunBanner {
     if (Test-DryRun) {
-        $TxtDryRunBanner.Text = "DRY RUN is ON - nothing will be changed. Actions only print what they WOULD do in the Log tab."
+        $TxtDryRunBanner.Text = "DRY RUN is ON - nothing will be changed. Actions only print what they WOULD do in the Log tab; no action log is created or changed."
         $TxtDryRunBanner.Foreground = "#FFD54F"
         Write-Log "Dry Run enabled: actions are simulated only."
     } else {
@@ -1056,20 +1080,45 @@ foreach ($cat in $categories) {
     $AppsPanel.Children.Add($group) | Out-Null
 }
 
-# Build Tweaks tab
+# Build Tweaks tab: profiles only preselect options; applying still requires a separate confirmation.
 $tweakCheckboxMap = @{}
-$tweakGroup = New-Object System.Windows.Controls.GroupBox
-$tweakGroup.Header = "System Tweaks (each one restores its OWN previous value on Undo)"
-$tweakGroup.Foreground = "#4FC3F7"
-$tweakStack = New-Object System.Windows.Controls.StackPanel
-foreach ($tweak in $TweakCatalog) {
-    $cb = New-Object System.Windows.Controls.CheckBox
-    $cb.Content = $tweak.Name
-    $tweakCheckboxMap[$cb] = $tweak
-    $tweakStack.Children.Add($cb) | Out-Null
+$profileRow = New-Object System.Windows.Controls.StackPanel
+$profileRow.Orientation = 'Horizontal'
+$profileLabel = New-Object System.Windows.Controls.TextBlock
+$profileLabel.Text = 'ملف اقتراحات:'; $profileLabel.VerticalAlignment = 'Center'; $profileLabel.Margin = '4'
+$profileCombo = New-Object System.Windows.Controls.ComboBox
+$profileCombo.Width = 190; $profileCombo.Margin = '4'; $profileCombo.Padding = '4'
+@('اختيار يدوي','اعتيادي','متقدم','أداء') | ForEach-Object { [void]$profileCombo.Items.Add($_) }
+$profileCombo.SelectedIndex = 0
+$profileButton = New-Object System.Windows.Controls.Button
+$profileButton.Content = 'تحديد الخيارات المقترحة'; $profileButton.Margin = '4'
+[void]$profileRow.Children.Add($profileLabel); [void]$profileRow.Children.Add($profileCombo); [void]$profileRow.Children.Add($profileButton)
+[void]$TweaksPanel.Children.Add($profileRow)
+$profileButton.Add_Click({
+    $choice = [string]$profileCombo.SelectedItem
+    if ($choice -eq 'اختيار يدوي') {
+        foreach ($cb in $tweakCheckboxMap.Keys) { $cb.IsChecked = $false }
+        Write-Log 'Profile selection reset to manual; no settings were changed.'
+        return
+    }
+    foreach ($cb in $tweakCheckboxMap.Keys) { $cb.IsChecked = ((Get-TweakCategory $tweakCheckboxMap[$cb].Key) -eq $choice) }
+    Write-Log "Profile '$choice' selected. These are only checkboxes; no setting has been changed."
+})
+$groupOrder = @('اعتيادي','متقدم','أداء')
+foreach ($cat in $groupOrder) {
+    $tweakGroup = New-Object System.Windows.Controls.GroupBox
+    $tweakGroup.Header = $cat
+    $tweakGroup.Foreground = '#4FC3F7'
+    $tweakStack = New-Object System.Windows.Controls.StackPanel
+    foreach ($tweak in @($TweakCatalog | Where-Object { (Get-TweakCategory $_.Key) -eq $cat })) {
+        $cb = New-Object System.Windows.Controls.CheckBox
+        $cb.Content = $tweak.Name
+        $tweakCheckboxMap[$cb] = $tweak
+        [void]$tweakStack.Children.Add($cb)
+    }
+    $tweakGroup.Content = $tweakStack
+    [void]$TweaksPanel.Children.Add($tweakGroup)
 }
-$tweakGroup.Content = $tweakStack
-$TweaksPanel.Children.Add($tweakGroup) | Out-Null
 
 # ----------------------------------------------------------------------------
 # Uninstall tab logic
@@ -1181,12 +1230,24 @@ $BtnUninstallSelected.Add_Click({
 # Security tab logic (Windows Defender)
 # ----------------------------------------------------------------------------
 function Get-DefenderStatusText {
+    $lines = New-Object System.Collections.Generic.List[string]
     try {
         $s = Get-MpComputerStatus -ErrorAction Stop
-        return "Real-time protection: $($s.RealTimeProtectionEnabled) | Antivirus enabled: $($s.AntivirusEnabled) | Signatures updated: $($s.AntivirusSignatureLastUpdated) | Last quick scan age: $($s.QuickScanAge) day(s) | Last full scan age: $($s.FullScanAge) day(s)"
+        $lines.Add("Defender: Antivirus enabled=$($s.AntivirusEnabled); real-time protection=$($s.RealTimeProtectionEnabled)")
+        $lines.Add("Signatures last updated=$($s.AntivirusSignatureLastUpdated); quick scan age=$($s.QuickScanAge) day(s); full scan age=$($s.FullScanAge) day(s)")
+        try {
+            $pref = Get-MpPreference -ErrorAction Stop
+            $lines.Add("Cloud reporting (MAPSReporting)=$($pref.MAPSReporting); PUA protection=$($pref.PUAProtection)")
+            if ($pref.PSObject.Properties.Name -contains 'DisableTamperProtection') { $lines.Add("Tamper protection disabled flag=$($pref.DisableTamperProtection) (availability varies by Windows version/policy)") }
+        } catch { $lines.Add("Defender preferences unavailable: $($_.Exception.Message)") }
     } catch {
-        return "Windows Defender status unavailable on this system: $($_.Exception.Message)"
+        $lines.Add("Windows Defender status unavailable: $($_.Exception.Message)")
     }
+    try {
+        $profiles = @(Get-NetFirewallProfile -ErrorAction Stop | ForEach-Object { "$($_.Name)=$($_.Enabled)" })
+        $lines.Add('Firewall profiles: ' + ($profiles -join ', '))
+    } catch { $lines.Add("Firewall status unavailable: $($_.Exception.Message)") }
+    return ($lines -join ' | ')
 }
 
 function Update-ThreatGrid {
@@ -1268,8 +1329,14 @@ $BtnRemoveThreats.Add_Click({
         return
     }
     try {
-        $before = @(Get-MpThreat -ErrorAction SilentlyContinue).Count
+        $beforeThreats = @(Get-MpThreat -ErrorAction SilentlyContinue)
+        $before = $beforeThreats.Count
         if ($before -eq 0) { Write-Log "No active threats to remove."; return }
+        $threatNames = ($beforeThreats | ForEach-Object { $_.ThreatName } | Select-Object -Unique) -join "`n- "
+        $confirm = [System.Windows.MessageBox]::Show(
+            "Request Windows Defender to remove/quarantine the $before listed threat record(s)?`n`n- $threatNames`n`nDefender decides the available remediation; review Protection History afterward.",
+            'Confirm threat remediation', 'YesNo', 'Warning')
+        if ($confirm -ne 'Yes') { Write-Log 'Threat remediation cancelled by user.'; return }
         Remove-MpThreat -ErrorAction Stop
         Write-Log "Requested removal/quarantine of all threats currently flagged by Windows Defender."
     } catch {
@@ -1328,6 +1395,23 @@ $BtnTweak.Add_Click({
     $selected = $tweakCheckboxMap.Keys | Where-Object { $_.IsChecked -eq $true }
     if (-not $selected) { Write-Log "No tweaks selected."; return }
     $dry = Test-DryRun
+    if (-not $dry) {
+        $previewLines = New-Object System.Collections.Generic.List[string]
+        foreach ($cb in $selected) {
+            $t = $tweakCheckboxMap[$cb]
+            try {
+                $st = & $t.GetState
+                $previewLines.Add("- $($t.Name)")
+                foreach ($line in @(& $t.Plan $st)) { $previewLines.Add("    $line") }
+            } catch { $previewLines.Add("- $($t.Name) (preview failed: $($_.Exception.Message))") }
+        }
+        $preview = ($previewLines -join "`n")
+        if ($preview.Length -gt 6500) { $preview = $preview.Substring(0,6500) + "`n... (preview truncated)" }
+        $confirm = [System.Windows.MessageBox]::Show(
+            "Review the selected changes below. Nothing has been changed yet:`n`n$preview`n`nApply these tweaks now? Undo will attempt to restore the saved prior state.",
+            'Confirm system changes', 'YesNo', 'Warning')
+        if ($confirm -ne 'Yes') { Write-Log 'Tweaks cancelled before making changes.'; return }
+    }
     foreach ($cb in $selected) {
         $tweak = $tweakCheckboxMap[$cb]
 
@@ -1374,7 +1458,7 @@ function Test-StateRestored($Saved, $Current) {
             $a = ConvertTo-HashtableDeep $sv
             $b = ConvertTo-HashtableDeep $cv
             if ([bool]$a.Exists -ne [bool]$b.Exists) { return $false }
-            if ($a.Exists -and ("$($a.Value)" -ne "$($b.Value)")) { return $false }
+            if ($a.Exists -and (("$($a.Value)" -ne "$($b.Value)") -or ("$($a.Kind)" -ne "$($b.Kind)"))) { return $false }
         } elseif ("$sv" -ne "$cv") {
             return $false
         }
@@ -1474,7 +1558,7 @@ $BtnUndo.Add_Click({
 
 Write-Log "STwaek ready. $($AppCatalog.Count) apps and $($TweakCatalog.Count) tweaks loaded."
 Write-Log "Action log stored at: $LogFile"
-Write-Log "Dry Run is ON by default. Uncheck 'Dry Run' at the bottom to make real changes."
+Write-Log "Dry Run is ON by default. No action log is created until a real change needs to be recorded."
 
 Update-UninstallGrid
 $TxtDefenderStatus.Text = "Status: " + (Get-DefenderStatusText)
