@@ -535,9 +535,9 @@ $TweakCatalog = @(
 function Get-TweakCategory([string]$Key) {
     $routine = @('ShowFileExtensions','ShowHiddenFiles','ShowThisPCOnDesktop','DarkMode','AlignTaskbarLeft','ClassicRightClickMenu','DisableStickyKeysPrompt')
     $performance = @('DisableGameBar','DisableBackgroundApps','DisableFastStartup','DisableStartupDelay','DisableSysMain','DisableHibernation','UltimatePerformancePlan')
-    if ($routine -contains $Key) { return 'اعتيادي' }
-    if ($performance -contains $Key) { return 'أداء' }
-    return 'متقدم'
+    if ($routine -contains $Key) { return 'Everyday' }
+    if ($performance -contains $Key) { return 'Performance' }
+    return 'Advanced'
 }
 
 # ============================================================================
@@ -838,35 +838,37 @@ function Invoke-UninstallCommand {
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="STwaek - App Installer, System Tweaks, Uninstaller &amp; Security"
-        Height="780" Width="1040" WindowStartupLocation="CenterScreen"
-        Background="#1e1e1e">
+        Height="820" Width="1180" MinHeight="700" MinWidth="980" WindowStartupLocation="CenterScreen"
+        Background="#17191F">
     <Window.Resources>
         <Style TargetType="CheckBox">
-            <Setter Property="Foreground" Value="White"/>
-            <Setter Property="Margin" Value="4,4,4,4"/>
+            <Setter Property="Foreground" Value="#E8EAF0"/>
+            <Setter Property="Margin" Value="5,5,5,5"/>
             <Setter Property="FontSize" Value="13"/>
         </Style>
         <Style TargetType="TextBlock">
-            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="Foreground" Value="#E8EAF0"/>
         </Style>
         <Style TargetType="GroupBox">
-            <Setter Property="Foreground" Value="#4FC3F7"/>
+            <Setter Property="Foreground" Value="#7DD3FC"/>
             <Setter Property="FontWeight" Value="Bold"/>
-            <Setter Property="Margin" Value="6"/>
+            <Setter Property="Margin" Value="8"/>
+            <Setter Property="Padding" Value="8"/>
         </Style>
         <Style TargetType="Button">
-            <Setter Property="Padding" Value="12,6"/>
-            <Setter Property="Margin" Value="6"/>
+            <Setter Property="Padding" Value="14,8"/>
+            <Setter Property="Margin" Value="5"/>
+            <Setter Property="MinHeight" Value="34"/>
             <Setter Property="FontWeight" Value="Bold"/>
         </Style>
     </Window.Resources>
     <DockPanel>
-        <TextBlock DockPanel.Dock="Top" Text="STwaek" FontSize="22" FontWeight="Bold"
-                   Foreground="#4FC3F7" Margin="12,10,0,0"/>
-        <TextBlock DockPanel.Dock="Top" Text="App installer + reversible system tweaks + full uninstaller + Windows Defender scan (no remote access feature)"
-                   FontSize="11" Foreground="#AAAAAA" Margin="12,0,0,4" TextWrapping="Wrap"/>
-        <TextBlock Name="TxtDryRunBanner" DockPanel.Dock="Top" Text="DRY RUN is ON - nothing will be changed. Actions only print what they WOULD do in the Log tab; no action log is created or changed."
-                   FontSize="12" FontWeight="Bold" Foreground="#FFD54F" Margin="12,0,0,8" TextWrapping="Wrap"/>
+        <TextBlock DockPanel.Dock="Top" Text="STwaek" FontSize="26" FontWeight="Bold"
+                   Foreground="#7DD3FC" Margin="14,12,0,0"/>
+        <TextBlock DockPanel.Dock="Top" Text="App manager  •  Reversible system tweaks  •  Uninstaller  •  Windows Security"
+                   FontSize="11" Foreground="#AAAAAA" Margin="14,0,0,6" TextWrapping="Wrap"/>
+        <TextBlock Name="TxtDryRunBanner" DockPanel.Dock="Top" Text="DRY RUN is ON  |  Safe preview mode: actions are simulated and no system changes are made."
+                   FontSize="12" FontWeight="Bold" Foreground="#FFD54F" Margin="14,0,0,10" TextWrapping="Wrap"/>
 
         <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,8,0,10">
             <Button Name="BtnInstall" Content="Install Selected Apps" Background="#2e7d32" Foreground="White" Width="170"/>
@@ -876,7 +878,7 @@ function Invoke-UninstallCommand {
                       Foreground="#FFD54F" FontWeight="Bold" Margin="14,0,0,0"/>
         </StackPanel>
 
-        <TabControl Margin="10" Background="#252526">
+        <TabControl Margin="10" Background="#20232B">
             <TabItem Header="Apps">
                 <ScrollViewer VerticalScrollBarVisibility="Auto">
                     <StackPanel Name="AppsPanel" Margin="10"/>
@@ -890,7 +892,7 @@ function Invoke-UninstallCommand {
             <TabItem Header="Uninstall Apps">
                 <DockPanel Margin="10">
                     <TextBlock DockPanel.Dock="Top" TextWrapping="Wrap" Margin="0,0,0,8" Foreground="#AAAAAA" FontSize="11"
-                               Text="Select one or more installed apps and remove them completely. Leftover suggestions rely mainly on the program's own registered install path, plus a narrow name match in AppData/ProgramData only - never a different still-installed app's folder, and never Documents/Desktop/Pictures/Downloads/OneDrive etc. You get a checklist to confirm exactly what else to delete."/>
+                               Text="Select installed apps to uninstall. Potential leftovers are shown separately for review; nothing is deleted automatically. Protected and shared locations are excluded."/>
                     <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="0,0,0,8">
                         <TextBlock Text="Search:" VerticalAlignment="Center" Margin="0,0,6,0"/>
                         <TextBox Name="FilterBox" Width="220" VerticalAlignment="Center"/>
@@ -898,7 +900,7 @@ function Invoke-UninstallCommand {
                         <Button Name="BtnUninstallSelected" Content="Uninstall Selected" Background="#c62828" Foreground="White" Width="180"/>
                     </StackPanel>
                     <DataGrid Name="UninstallGrid" AutoGenerateColumns="False" IsReadOnly="True" SelectionMode="Extended" SelectionUnit="FullRow"
-                              Background="#1e1e1e" Foreground="White" RowBackground="#252526" AlternatingRowBackground="#2d2d30"
+                              Background="#17191F" Foreground="White" RowBackground="#20232B" AlternatingRowBackground="#2d2d30"
                               HeadersVisibility="Column" GridLinesVisibility="Horizontal" CanUserAddRows="False">
                         <DataGrid.Columns>
                             <DataGridTextColumn Header="Application" Binding="{Binding DisplayName}" Width="2.2*"/>
@@ -911,16 +913,25 @@ function Invoke-UninstallCommand {
             <TabItem Header="Security">
                 <DockPanel Margin="10">
                     <TextBlock DockPanel.Dock="Top" TextWrapping="Wrap" Margin="0,0,0,8" Foreground="#AAAAAA" FontSize="11"
-                               Text="This calls Windows Defender's own built-in engine (Start-MpScan / Get-MpThreat / Remove-MpThreat). Results shown are exactly what Defender reports - nothing here is a custom scanner making its own claims."/>
-                    <TextBlock Name="TxtDefenderStatus" DockPanel.Dock="Top" Text="Status: not checked yet" Margin="0,0,0,8" TextWrapping="Wrap" Foreground="#FFD54F"/>
+                               Text="Uses Microsoft Defender and Windows Firewall status provided by Windows. Scans and remediation can take time; the activity indicator below shows when a task is running."/>
+                    <TextBlock Name="TxtDefenderStatus" DockPanel.Dock="Top" Text="Not checked yet. Select Check Status to retrieve current protection details." Margin="0,0,0,8" TextWrapping="Wrap" Foreground="#FFD54F"/>
                     <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="0,0,0,8">
                         <Button Name="BtnRefreshDefender" Content="Check Status" Width="140"/>
                         <Button Name="BtnQuickScan" Content="Quick Scan" Background="#1565c0" Foreground="White" Width="140"/>
-                        <Button Name="BtnFullScan" Content="Full Scan (background)" Background="#1565c0" Foreground="White" Width="180"/>
-                        <Button Name="BtnRemoveThreats" Content="Remove Detected Threats" Background="#c62828" Foreground="White" Width="200"/>
+                        <Button Name="BtnFullScan" Content="Full Scan" Background="#1565c0" Foreground="White" Width="180"/>
+                        <Button Name="BtnRemoveThreats" Content="Remediate Threats" Background="#c62828" Foreground="White" Width="200"/>
                     </StackPanel>
+                    <Border DockPanel.Dock="Top" Background="#20232B" BorderBrush="#3B4252" BorderThickness="1" CornerRadius="8" Padding="10" Margin="0,0,0,8">
+                        <StackPanel>
+                            <DockPanel LastChildFill="True">
+                                <TextBlock Name="TxtSecurityActivity" Text="Ready — no security task is running." Foreground="#A7F3D0" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                                <TextBlock Name="TxtSecurityElapsed" DockPanel.Dock="Right" Text="" Foreground="#9CA3AF" Margin="10,0,0,0" VerticalAlignment="Center"/>
+                            </DockPanel>
+                            <ProgressBar Name="SecurityProgress" Height="5" Margin="0,8,0,0" IsIndeterminate="False" Visibility="Collapsed" Minimum="0" Maximum="100"/>
+                        </StackPanel>
+                    </Border>
                     <DataGrid Name="ThreatGrid" AutoGenerateColumns="False" IsReadOnly="True" SelectionMode="Extended"
-                              Background="#1e1e1e" Foreground="White" RowBackground="#252526" AlternatingRowBackground="#2d2d30"
+                              Background="#17191F" Foreground="White" RowBackground="#20232B" AlternatingRowBackground="#2d2d30"
                               HeadersVisibility="Column" GridLinesVisibility="Horizontal" CanUserAddRows="False">
                         <DataGrid.Columns>
                             <DataGridTextColumn Header="Threat Name" Binding="{Binding ThreatName}" Width="2.5*"/>
@@ -932,7 +943,7 @@ function Invoke-UninstallCommand {
             </TabItem>
             <TabItem Header="Log">
                 <TextBox Name="LogBox" IsReadOnly="True" TextWrapping="Wrap" AcceptsReturn="True"
-                         VerticalScrollBarVisibility="Auto" Background="#1e1e1e" Foreground="#CCCCCC"
+                         VerticalScrollBarVisibility="Auto" Background="#17191F" Foreground="#CCCCCC"
                          FontFamily="Consolas" FontSize="12" Margin="10"/>
             </TabItem>
         </TabControl>
@@ -961,6 +972,9 @@ $BtnQuickScan         = $Window.FindName("BtnQuickScan")
 $BtnFullScan          = $Window.FindName("BtnFullScan")
 $BtnRemoveThreats     = $Window.FindName("BtnRemoveThreats")
 $ThreatGrid           = $Window.FindName("ThreatGrid")
+$TxtSecurityActivity  = $Window.FindName("TxtSecurityActivity")
+$TxtSecurityElapsed   = $Window.FindName("TxtSecurityElapsed")
+$SecurityProgress     = $Window.FindName("SecurityProgress")
 
 function Write-Log {
     param([string]$Text)
@@ -973,11 +987,11 @@ function Write-Log {
 # Dry Run toggle: updates the banner and tells the user which mode is active.
 function Update-DryRunBanner {
     if (Test-DryRun) {
-        $TxtDryRunBanner.Text = "DRY RUN is ON - nothing will be changed. Actions only print what they WOULD do in the Log tab; no action log is created or changed."
+        $TxtDryRunBanner.Text = "DRY RUN is ON  |  Safe preview mode: actions are simulated and no system changes are made."
         $TxtDryRunBanner.Foreground = "#FFD54F"
         Write-Log "Dry Run enabled: actions are simulated only."
     } else {
-        $TxtDryRunBanner.Text = "DRY RUN is OFF - actions will make REAL changes to this computer."
+        $TxtDryRunBanner.Text = "DRY RUN is OFF  |  Real changes are enabled. Review each confirmation carefully."
         $TxtDryRunBanner.Foreground = "#EF5350"
         Write-Log "Dry Run DISABLED: actions will now make real changes."
     }
@@ -995,7 +1009,7 @@ function Show-LeftoverReviewDialog {
     [xml]$DlgXaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Review Leftover Folders" Height="540" Width="760" WindowStartupLocation="CenterScreen" Background="#1e1e1e">
+        Title="Review Leftover Folders" Height="540" Width="760" WindowStartupLocation="CenterScreen" Background="#17191F">
     <DockPanel Margin="12">
         <TextBlock DockPanel.Dock="Top" TextWrapping="Wrap" Foreground="White" Margin="0,0,0,8"
                    Text="These folders matched the uninstalled program's registered install path or exact AppData/ProgramData folder name. NOTHING is selected by default. Tick only what you are sure about. By default, ticked folders are MOVED to a quarantine folder (restorable), not erased."/>
@@ -1085,18 +1099,18 @@ $tweakCheckboxMap = @{}
 $profileRow = New-Object System.Windows.Controls.StackPanel
 $profileRow.Orientation = 'Horizontal'
 $profileLabel = New-Object System.Windows.Controls.TextBlock
-$profileLabel.Text = 'ملف اقتراحات:'; $profileLabel.VerticalAlignment = 'Center'; $profileLabel.Margin = '4'
+$profileLabel.Text = 'Suggestion profile:'; $profileLabel.VerticalAlignment = 'Center'; $profileLabel.Margin = '4'
 $profileCombo = New-Object System.Windows.Controls.ComboBox
 $profileCombo.Width = 190; $profileCombo.Margin = '4'; $profileCombo.Padding = '4'
-@('اختيار يدوي','اعتيادي','متقدم','أداء') | ForEach-Object { [void]$profileCombo.Items.Add($_) }
+@('Manual selection','Everyday','Advanced','Performance') | ForEach-Object { [void]$profileCombo.Items.Add($_) }
 $profileCombo.SelectedIndex = 0
 $profileButton = New-Object System.Windows.Controls.Button
-$profileButton.Content = 'تحديد الخيارات المقترحة'; $profileButton.Margin = '4'
+$profileButton.Content = 'Select Suggested Tweaks'; $profileButton.Margin = '4'
 [void]$profileRow.Children.Add($profileLabel); [void]$profileRow.Children.Add($profileCombo); [void]$profileRow.Children.Add($profileButton)
 [void]$TweaksPanel.Children.Add($profileRow)
 $profileButton.Add_Click({
     $choice = [string]$profileCombo.SelectedItem
-    if ($choice -eq 'اختيار يدوي') {
+    if ($choice -eq 'Manual selection') {
         foreach ($cb in $tweakCheckboxMap.Keys) { $cb.IsChecked = $false }
         Write-Log 'Profile selection reset to manual; no settings were changed.'
         return
@@ -1104,7 +1118,7 @@ $profileButton.Add_Click({
     foreach ($cb in $tweakCheckboxMap.Keys) { $cb.IsChecked = ((Get-TweakCategory $tweakCheckboxMap[$cb].Key) -eq $choice) }
     Write-Log "Profile '$choice' selected. These are only checkboxes; no setting has been changed."
 })
-$groupOrder = @('اعتيادي','متقدم','أداء')
+$groupOrder = @('Everyday','Advanced','Performance')
 foreach ($cat in $groupOrder) {
     $tweakGroup = New-Object System.Windows.Controls.GroupBox
     $tweakGroup.Header = $cat
@@ -1227,89 +1241,135 @@ $BtnUninstallSelected.Add_Click({
 })
 
 # ----------------------------------------------------------------------------
-# Security tab logic (Windows Defender)
+# Security tab logic (Microsoft Defender) - background jobs keep the UI responsive.
+# The indeterminate progress bar is visible for every long-running security action.
 # ----------------------------------------------------------------------------
-function Get-DefenderStatusText {
-    $lines = New-Object System.Collections.Generic.List[string]
-    try {
-        $s = Get-MpComputerStatus -ErrorAction Stop
-        $lines.Add("Defender: Antivirus enabled=$($s.AntivirusEnabled); real-time protection=$($s.RealTimeProtectionEnabled)")
-        $lines.Add("Signatures last updated=$($s.AntivirusSignatureLastUpdated); quick scan age=$($s.QuickScanAge) day(s); full scan age=$($s.FullScanAge) day(s)")
-        try {
-            $pref = Get-MpPreference -ErrorAction Stop
-            $lines.Add("Cloud reporting (MAPSReporting)=$($pref.MAPSReporting); PUA protection=$($pref.PUAProtection)")
-            if ($pref.PSObject.Properties.Name -contains 'DisableTamperProtection') { $lines.Add("Tamper protection disabled flag=$($pref.DisableTamperProtection) (availability varies by Windows version/policy)") }
-        } catch { $lines.Add("Defender preferences unavailable: $($_.Exception.Message)") }
-    } catch {
-        $lines.Add("Windows Defender status unavailable: $($_.Exception.Message)")
+function Set-SecurityBusy {
+    param([bool]$Busy, [string]$Message = '')
+    $SecurityProgress.Visibility = if ($Busy) { 'Visible' } else { 'Collapsed' }
+    $SecurityProgress.IsIndeterminate = $Busy
+    $TxtSecurityActivity.Text = if ($Message) { $Message } elseif ($Busy) { 'Working… please wait.' } else { 'Ready — no security task is running.' }
+    $TxtSecurityActivity.Foreground = if ($Busy) { '#FDE68A' } else { '#A7F3D0' }
+    foreach ($b in @($BtnRefreshDefender,$BtnQuickScan,$BtnFullScan,$BtnRemoveThreats)) { $b.IsEnabled = -not $Busy }
+    $TxtSecurityElapsed.Text = ''
+    $Window.Dispatcher.Invoke([System.Windows.Threading.DispatcherPriority]::Background, [action]{})
+}
+
+function Start-SecurityJob {
+    param([string]$Kind, [string]$Message, [scriptblock]$ScriptBlock)
+    if ($script:SecurityJob) {
+        Write-Log 'A security task is already running.'
+        return
     }
     try {
-        $profiles = @(Get-NetFirewallProfile -ErrorAction Stop | ForEach-Object { "$($_.Name)=$($_.Enabled)" })
-        $lines.Add('Firewall profiles: ' + ($profiles -join ', '))
-    } catch { $lines.Add("Firewall status unavailable: $($_.Exception.Message)") }
-    return ($lines -join ' | ')
+        $script:SecurityJobKind = $Kind
+        $script:SecurityJobStarted = Get-Date
+        $script:SecurityJob = Start-Job -ScriptBlock $ScriptBlock
+        Set-SecurityBusy -Busy $true -Message $Message
+        $script:SecurityTimer.Start()
+        Write-Log "$Message"
+    } catch {
+        $script:SecurityJob = $null
+        Set-SecurityBusy -Busy $false -Message 'Could not start the security task. See the Log tab for details.'
+        Write-Log "Could not start security task '$Kind': $($_.Exception.Message)"
+    }
 }
 
 function Update-ThreatGrid {
     try {
         $threats = @(Get-MpThreat -ErrorAction Stop)
         $ThreatGrid.ItemsSource = @($threats | Select-Object ThreatID, ThreatName, SeverityID, @{N='Status';E={$_.CurrentStatus}})
-        if ($threats.Count -gt 0) { Write-Log "Windows Defender currently lists $($threats.Count) active threat(s)." }
-        else { Write-Log "Windows Defender reports no active threats detected." }
+        if ($threats.Count -gt 0) { Write-Log "Microsoft Defender currently lists $($threats.Count) threat record(s)." }
+        else { Write-Log 'Microsoft Defender reports no active threats.' }
     } catch {
-        Write-Log "Could not query Windows Defender threats: $($_.Exception.Message)"
+        Write-Log "Could not query Microsoft Defender threats: $($_.Exception.Message)"
     }
 }
 
-$BtnRefreshDefender.Add_Click({ $TxtDefenderStatus.Text = "Status: " + (Get-DefenderStatusText) })
-
-$BtnQuickScan.Add_Click({
-    if (Test-DryRun) {
-        Write-Log "[DRY RUN] Would run: Start-MpScan -ScanType QuickScan (not started; Defender may quarantine items during a real scan)."
-        return
-    }
-    Write-Log "Starting Windows Defender Quick Scan (this window will be busy for a bit) ..."
-    try {
-        Start-MpScan -ScanType QuickScan -ErrorAction Stop
-        Write-Log "Quick scan finished."
-        Update-ThreatGrid
-    } catch {
-        Write-Log "Quick scan failed: $($_.Exception.Message)"
+$script:SecurityJob = $null
+$script:SecurityJobKind = ''
+$script:SecurityJobStarted = Get-Date
+$script:SecurityTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:SecurityTimer.Interval = [TimeSpan]::FromSeconds(1)
+$script:SecurityTimer.Add_Tick({
+    if (-not $script:SecurityJob) { $script:SecurityTimer.Stop(); return }
+    $elapsed = [int]((Get-Date) - $script:SecurityJobStarted).TotalSeconds
+    $TxtSecurityElapsed.Text = ('{0:mm\:ss} elapsed' -f [TimeSpan]::FromSeconds($elapsed))
+    if ($script:SecurityJob.State -in @('Completed','Failed','Stopped')) {
+        $jobKind = $script:SecurityJobKind
+        $jobState = $script:SecurityJob.State
+        $jobErrors = @($script:SecurityJob.ChildJobs | ForEach-Object { $_.JobStateInfo.Reason } | Where-Object { $_ })
+        $jobOutput = @()
+        try { $jobOutput = @(Receive-Job -Job $script:SecurityJob -ErrorAction SilentlyContinue) } catch { }
+        Remove-Job -Job $script:SecurityJob -Force -ErrorAction SilentlyContinue
+        $script:SecurityJob = $null
+        $script:SecurityJobKind = ''
+        $script:SecurityTimer.Stop()
+        Set-SecurityBusy -Busy $false
+        if ($jobState -eq 'Completed' -and -not $jobErrors) {
+            switch ($jobKind) {
+                'Status' {
+                    $TxtDefenderStatus.Text = ($jobOutput | ForEach-Object { [string]$_ }) -join ' '
+                    Write-Log 'Security status check completed.'
+                }
+                'QuickScan' { Write-Log 'Microsoft Defender Quick Scan command completed.'; Update-ThreatGrid }
+                'FullScan' { Write-Log 'Microsoft Defender Full Scan command completed. Check Windows Security for the latest scan state.'; Update-ThreatGrid }
+                'Remediate' { Write-Log 'Requested Microsoft Defender threat remediation completed. Review Windows Security > Protection History.'; Update-ThreatGrid }
+            }
+            $TxtSecurityActivity.Text = 'Completed — see the status details and Log tab for results.'
+            $TxtSecurityActivity.Foreground = '#A7F3D0'
+        } else {
+            $detail = if ($jobErrors.Count) { ($jobErrors -join '; ') } elseif ($jobOutput.Count) { ($jobOutput -join '; ') } else { "Job state: $jobState" }
+            Write-Log "Security task '$jobKind' did not complete cleanly: $detail"
+            $TxtSecurityActivity.Text = 'Task ended with an issue — check the Log tab.'
+            $TxtSecurityActivity.Foreground = '#FCA5A5'
+        }
+        $TxtSecurityElapsed.Text = ('Finished in {0:mm\:ss}' -f [TimeSpan]::FromSeconds($elapsed))
     }
 })
 
-$script:FullScanJob = $null
-$FullScanTimer = New-Object System.Windows.Threading.DispatcherTimer
-$FullScanTimer.Interval = [TimeSpan]::FromSeconds(5)
-$FullScanTimer.Add_Tick({
-    if ($script:FullScanJob -and $script:FullScanJob.State -ne 'Running') {
-        $FullScanTimer.Stop()
-        $jobErrors = $null
-        try { Receive-Job -Job $script:FullScanJob -ErrorVariable jobErrors -ErrorAction SilentlyContinue | Out-Null } catch { }
-        if ($script:FullScanJob.State -eq 'Completed' -and -not $jobErrors) {
-            Write-Log "Full scan completed successfully."
-        } else {
-            $errText = if ($jobErrors) { ($jobErrors -join "; ") } else { "no further detail" }
-            Write-Log "Full scan finished with state '$($script:FullScanJob.State)' - $errText."
-        }
-        Remove-Job -Job $script:FullScanJob -ErrorAction SilentlyContinue
-        $script:FullScanJob = $null
-        Update-ThreatGrid
+$BtnRefreshDefender.Add_Click({
+    Start-SecurityJob -Kind 'Status' -Message 'Checking Microsoft Defender and Windows Firewall status…' -ScriptBlock {
+        $lines = New-Object System.Collections.Generic.List[string]
+        try {
+            $s = Get-MpComputerStatus -ErrorAction Stop
+            $lines.Add("Microsoft Defender: antivirus enabled=$($s.AntivirusEnabled); real-time protection=$($s.RealTimeProtectionEnabled)")
+            $lines.Add("Signatures last updated=$($s.AntivirusSignatureLastUpdated); quick scan age=$($s.QuickScanAge) day(s); full scan age=$($s.FullScanAge) day(s)")
+            try {
+                $pref = Get-MpPreference -ErrorAction Stop
+                $lines.Add("Cloud reporting (MAPSReporting)=$($pref.MAPSReporting); potentially unwanted app protection=$($pref.PUAProtection)")
+                if ($pref.PSObject.Properties.Name -contains 'DisableTamperProtection') { $lines.Add("Tamper protection disabled flag=$($pref.DisableTamperProtection) (if exposed by this Windows version)") }
+            } catch { $lines.Add("Defender preferences unavailable: $($_.Exception.Message)") }
+        } catch { $lines.Add("Microsoft Defender status unavailable: $($_.Exception.Message)") }
+        try {
+            $profiles = @(Get-NetFirewallProfile -ErrorAction Stop | ForEach-Object { "$($_.Name)=$($_.Enabled)" })
+            $lines.Add('Windows Firewall profiles: ' + ($profiles -join ', '))
+        } catch { $lines.Add("Firewall status unavailable: $($_.Exception.Message)") }
+        ($lines -join ' | ')
+    }
+})
+
+$BtnQuickScan.Add_Click({
+    if (Test-DryRun) {
+        Write-Log '[DRY RUN] Quick Scan was not started. Turn Dry Run off to request a real Microsoft Defender scan.'
+        $TxtSecurityActivity.Text = 'Dry Run is ON — no scan was started.'
+        return
+    }
+    Start-SecurityJob -Kind 'QuickScan' -Message 'Microsoft Defender Quick Scan is running…' -ScriptBlock {
+        Start-MpScan -ScanType QuickScan -ErrorAction Stop
+        'Quick scan request completed.'
     }
 })
 
 $BtnFullScan.Add_Click({
     if (Test-DryRun) {
-        Write-Log "[DRY RUN] Would start: Start-MpScan -ScanType FullScan in a background job (not started)."
+        Write-Log '[DRY RUN] Full Scan was not started. Turn Dry Run off to request a real Microsoft Defender scan.'
+        $TxtSecurityActivity.Text = 'Dry Run is ON — no scan was started.'
         return
     }
-    if ($script:FullScanJob) { Write-Log "A full scan is already running in the background."; return }
-    Write-Log "Starting Windows Defender Full Scan in the background (this can take a long time; you can keep using the tool meanwhile) ..."
-    try {
-        $script:FullScanJob = Start-Job -ScriptBlock { Start-MpScan -ScanType FullScan }
-        $FullScanTimer.Start()
-    } catch {
-        Write-Log "Could not start full scan: $($_.Exception.Message)"
+    Start-SecurityJob -Kind 'FullScan' -Message 'Microsoft Defender Full Scan is running. This can take a long time…' -ScriptBlock {
+        Start-MpScan -ScanType FullScan -ErrorAction Stop
+        'Full scan request completed.'
     }
 })
 
@@ -1317,32 +1377,28 @@ $BtnRemoveThreats.Add_Click({
     if (Test-DryRun) {
         try {
             $found = @(Get-MpThreat -ErrorAction Stop)
-            if ($found.Count -eq 0) {
-                Write-Log "[DRY RUN] Defender lists no threats; Remove-MpThreat would have nothing to do."
-            } else {
-                Write-Log "[DRY RUN] Would run Remove-MpThreat. Threats Defender currently lists ($($found.Count)):"
+            if ($found.Count -eq 0) { Write-Log '[DRY RUN] Defender lists no threats; there is nothing to remediate.' }
+            else {
+                Write-Log "[DRY RUN] Would request Defender remediation for $($found.Count) threat record(s):"
                 foreach ($t in $found) { Write-Log "[DRY RUN]   $($t.ThreatName) (severity $($t.SeverityID))" }
             }
-        } catch {
-            Write-Log "[DRY RUN] Could not query Defender threats: $($_.Exception.Message)"
-        }
+        } catch { Write-Log "[DRY RUN] Could not query Defender threats: $($_.Exception.Message)" }
+        $TxtSecurityActivity.Text = 'Dry Run is ON — no remediation was started.'
         return
     }
-    try {
-        $beforeThreats = @(Get-MpThreat -ErrorAction SilentlyContinue)
-        $before = $beforeThreats.Count
-        if ($before -eq 0) { Write-Log "No active threats to remove."; return }
-        $threatNames = ($beforeThreats | ForEach-Object { $_.ThreatName } | Select-Object -Unique) -join "`n- "
-        $confirm = [System.Windows.MessageBox]::Show(
-            "Request Windows Defender to remove/quarantine the $before listed threat record(s)?`n`n- $threatNames`n`nDefender decides the available remediation; review Protection History afterward.",
-            'Confirm threat remediation', 'YesNo', 'Warning')
-        if ($confirm -ne 'Yes') { Write-Log 'Threat remediation cancelled by user.'; return }
+    try { $beforeThreats = @(Get-MpThreat -ErrorAction Stop) }
+    catch { Write-Log "Could not query Defender threats: $($_.Exception.Message)"; return }
+    $before = $beforeThreats.Count
+    if ($before -eq 0) { Write-Log 'No active threats to remediate.'; $TxtSecurityActivity.Text = 'No active threats were reported by Defender.'; return }
+    $threatNames = ($beforeThreats | ForEach-Object { $_.ThreatName } | Select-Object -Unique) -join "`n- "
+    $confirm = [System.Windows.MessageBox]::Show(
+        "Ask Microsoft Defender to remove or quarantine the $before listed threat record(s)?`n`n- $threatNames`n`nDefender chooses the available remediation. Review Protection History afterward.",
+        'Confirm Threat Remediation', 'YesNo', 'Warning')
+    if ($confirm -ne 'Yes') { Write-Log 'Threat remediation cancelled by user.'; return }
+    Start-SecurityJob -Kind 'Remediate' -Message 'Asking Microsoft Defender to remediate detected threats…' -ScriptBlock {
         Remove-MpThreat -ErrorAction Stop
-        Write-Log "Requested removal/quarantine of all threats currently flagged by Windows Defender."
-    } catch {
-        Write-Log "Could not remove threats automatically: $($_.Exception.Message). Try the Windows Security app's Protection History instead."
+        'Remediation request completed.'
     }
-    Update-ThreatGrid
 })
 
 # ----------------------------------------------------------------------------
@@ -1561,6 +1617,6 @@ Write-Log "Action log stored at: $LogFile"
 Write-Log "Dry Run is ON by default. No action log is created until a real change needs to be recorded."
 
 Update-UninstallGrid
-$TxtDefenderStatus.Text = "Status: " + (Get-DefenderStatusText)
+$TxtDefenderStatus.Text = "Not checked yet. Select Check Status to retrieve current protection details."
 
 $Window.ShowDialog() | Out-Null
