@@ -36,8 +36,9 @@ irm https://raw.githubusercontent.com/MR-X905-dev/STweak/main/STweak.ps1 | iex
 Want to try the latest development features? Run PowerShell as Administrator and execute:
 
 ```powershell
-irm https://raw.githubusercontent.com/MR-X905-dev/STweak/refs/heads/dev/dev-STweak.ps1 | iex
+irm https://raw.githubusercontent.com/MR-X905-dev/STweak/refs/heads/main/dev/dev-STweak.ps1 | iex
 ```
+
 
 > ⚠️ **Warning:** The development version may contain bugs or unfinished features. Review the script before running it.
 
