@@ -500,7 +500,9 @@ function Get-InstalledPrograms {
     )
     $raw = foreach ($p in $uninstallPaths) { Get-ItemProperty -Path $p -ErrorAction SilentlyContinue }
     $raw |
-        Where-Object { $_.DisplayName -and -not $_.SystemComponent -and ($_.UninstallString -or $_.QuietUninstallString) } |
+        Where-Object {
+            $_.DisplayName -and
+            (-not ($_.PSObject.Properties.Name -contains "SystemComponent") -or -not $_.SystemComponent) -and ($_.UninstallString -or $_.QuietUninstallString) } |
         Group-Object DisplayName |
         ForEach-Object {
             $e = $_.Group[0]
@@ -1514,3 +1516,9 @@ Update-UninstallGrid
 $TxtDefenderStatus.Text = "Not checked yet. Select Check Status to retrieve current protection details."
 
 $Window.ShowDialog() | Out-Null
+
+function Test-STweakProperty {
+    param($Object,[string]$Property)
+    if ($null -eq $Object) { return $false }
+    return $Object.PSObject.Properties.Name -contains $Property
+}
