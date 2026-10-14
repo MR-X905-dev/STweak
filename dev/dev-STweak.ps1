@@ -1,44 +1,43 @@
-#Requires -RunAsAdministrator
-<#
-    STwaek - Windows App Installer, System Tweaks & Full Uninstaller
-    Inspired by Chris Titus Tech's WinUtil (https://christitus.com/win)
 
-    Design notes (read this if you're auditing the code):
-    - Every tweak snapshots its OWN previous registry/service state before
-      applying anything. "Undo" restores that exact saved state - it does
-      NOT assume a hardcoded default. If a value didn't exist before, undo
-      removes it; if it existed, undo restores the exact previous value.
-    - Tweak names avoid promising specific performance gains (FPS, speed).
-      They're described as commonly recommended, with results varying by
-      machine - because that is what's actually true.
-    - The "deep uninstall" leftover scan only proposes (a) the program's own
-      registered install folder and (b) an AppData/ProgramData folder whose
-      name EXACTLY matches the program. Every candidate passes one gatekeeper
-      (Test-SafeLeftoverPath): allowed roots only, protected names, personal
-      data folders, symlinks/junctions, other programs' folders and running
-      processes are all refused - and it is re-checked right before removal.
-      Items are unticked by default, need typing DELETE, and are moved to a
-      quarantine folder unless permanent deletion is explicitly ticked.
-    - The Security tab does not implement a custom virus scanner. It calls
-      Windows Defender's own official cmdlets (Start-MpScan, Get-MpThreat,
-      Remove-MpThreat) so detection/removal is backed by Microsoft's real
-      antivirus engine, not a hand-rolled heuristic that could be wrong in
-      either direction.
-    - No remote-control / remote-screen feature is included in this tool.
-    - DRY RUN mode (checkbox at the bottom, ON by default): every action
-      button only READS the system and prints what it WOULD do to the Log
-      tab. Nothing is installed, uninstalled, changed, deleted, scanned or
-      written to the action log while Dry Run is checked.
-#>
 
 Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
 
-# ============================================================================
-# Paths / action log "
-# ============================================================================
-$LogDir  = Join-Path $env:ProgramData "STwaek"
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+
+function Invoke-STweakSafe {
+    param([scriptblock]$Action)
+    try {
+        & $Action
+        return $true
+    } catch {
+        try { Write-LogSafe ("Error: " + $_.Exception.Message) } catch {}
+        return $false
+    }
+}
+
+function Get-STweakSystemInfo {
+    try {
+        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+        $cpu = Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1
+        $mem = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+        [pscustomobject]@{
+            OS = $os.Caption
+            Version = $os.Version
+            CPU = $cpu.Name
+            MemoryGB = [math]::Round($mem.TotalPhysicalMemory / 1GB, 2)
+            Uptime = ((Get-Date) - $os.LastBootUpTime).ToString()
+        }
+    } catch {
+        $null
+    }
+}
+
+
+
+$LogDir  = Join-Path $env:ProgramData "STweak"
 $LogFile = Join-Path $LogDir "actions.json"
 
 $QuarantineDir = Join-Path $LogDir "Quarantine"
@@ -51,9 +50,6 @@ function New-EmptyActionLog {
     [PSCustomObject]@{ schemaVersion = 2; installedApps = @(); appliedTweaks = @() }
 }
 
-# Reads and VALIDATES the action log. A damaged file is never silently
-# discarded: a copy is kept as *.corrupt-<time>, and the last good backup
-# (.bak, written by every save) is tried before falling back to an empty log.
 function Get-ActionLog {
     foreach ($candidate in @($LogFile, "$LogFile.bak")) {
         if (-not (Test-Path -LiteralPath $candidate)) { continue }
@@ -78,9 +74,6 @@ function Get-ActionLog {
     return (New-EmptyActionLog)
 }
 
-# Atomic save: write to a temp file, prove it parses back, then swap it in
-# (keeping the previous version as .bak). A crash mid-write can no longer
-# leave a half-written action log.
 function Save-ActionLog($log) {
     if (-not (Test-Path -LiteralPath $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force -ErrorAction Stop | Out-Null }
     $log | Add-Member -NotePropertyName schemaVersion -NotePropertyValue 2 -Force
@@ -95,14 +88,9 @@ function Save-ActionLog($log) {
     }
 }
 
-# The action log is created lazily only when a real action needs to save state.
 
-# True while the "Dry Run" checkbox is checked. $ChkDryRun is created later
-# when the window is built; this is only evaluated at click time.
 function Test-DryRun { return ($null -ne $ChkDryRun -and $ChkDryRun.IsChecked -eq $true) }
 
-# Converts a PSCustomObject (as produced by ConvertFrom-Json) back into a
-# plain Hashtable so tweak Restore scriptblocks can index it with ["key"].
 function ConvertTo-HashtableDeep($obj) {
     if ($null -eq $obj) { return @{} }
     if ($obj -is [System.Collections.IDictionary]) { return $obj }
@@ -111,7 +99,6 @@ function ConvertTo-HashtableDeep($obj) {
     return $h
 }
 
-# Human-readable lines describing what Undo WOULD restore from a saved state.
 function Format-SavedState($State) {
     $h = ConvertTo-HashtableDeep $State
     foreach ($k in $h.Keys) {
@@ -143,8 +130,6 @@ function Add-AppliedTweak($tweakKey, $displayName, $state) {
     $list = @($log.appliedTweaks)
     $existing = $list | Where-Object { $_.key -eq $tweakKey }
     if ($existing) {
-        # Already applied before: keep the ORIGINAL saved baseline state
-        # (that's the real pre-tweak value); only refresh the date.
         foreach ($item in $list) { if ($item.key -eq $tweakKey) { $item.date = (Get-Date).ToString("s") } }
     } else {
         $list += [PSCustomObject]@{ key = $tweakKey; name = $displayName; date = (Get-Date).ToString("s"); state = $state }
@@ -178,13 +163,9 @@ function Remove-InstalledAppEntry($wingetId) {
     Save-ActionLog $log
 }
 
-# ============================================================================
-# App catalog (winget IDs), grouped by category
-# ============================================================================
 function App($Name, $Id, $Cat) { [PSCustomObject]@{ Name = $Name; Id = $Id; Cat = $Cat } }
 
 $AppCatalog = @(
-    # Browsers
     (App "Google Chrome"        "Google.Chrome"               "Browsers")
     (App "Mozilla Firefox"      "Mozilla.Firefox"              "Browsers")
     (App "Brave Browser"        "Brave.Brave"                  "Browsers")
@@ -193,7 +174,6 @@ $AppCatalog = @(
     (App "Vivaldi"              "VivaldiTechnologies.Vivaldi"  "Browsers")
     (App "Tor Browser"          "TorProject.TorBrowser"        "Browsers")
 
-    # Developer Tools
     (App "Visual Studio Code"   "Microsoft.VisualStudioCode"   "Developer Tools")
     (App "Visual Studio Community" "Microsoft.VisualStudio.2022.Community" "Developer Tools")
     (App "Git"                  "Git.Git"                      "Developer Tools")
@@ -213,7 +193,6 @@ $AppCatalog = @(
     (App "Sublime Text"         "SublimeHQ.SublimeText.4"      "Developer Tools")
     (App "CMake"                "Kitware.CMake"                "Developer Tools")
 
-    # System Utilities
     (App "7-Zip"                "7zip.7zip"                    "System Utilities")
     (App "WinRAR"               "RARLab.WinRAR"                "System Utilities")
     (App "PowerToys"            "Microsoft.PowerToys"          "System Utilities")
@@ -224,7 +203,6 @@ $AppCatalog = @(
     (App "balenaEtcher"         "Balena.Etcher"                "System Utilities")
     (App "Notepad++"            "Notepad++.Notepad++"          "System Utilities")
 
-    # Media & Creative
     (App "VLC Media Player"     "VideoLAN.VLC"                 "Media & Creative")
     (App "OBS Studio"           "OBSProject.OBSStudio"         "Media & Creative")
     (App "HandBrake"            "HandBrake.HandBrake"          "Media & Creative")
@@ -237,7 +215,6 @@ $AppCatalog = @(
     (App "Krita"                "KDE.Krita"                    "Media & Creative")
     (App "Paint.NET"            "dotPDNLLC.paintdotnet"        "Media & Creative")
 
-    # Communication
     (App "Discord"              "Discord.Discord"              "Communication")
     (App "Telegram"             "Telegram.TelegramDesktop"     "Communication")
     (App "Zoom"                 "Zoom.Zoom"                    "Communication")
@@ -245,7 +222,6 @@ $AppCatalog = @(
     (App "Microsoft Teams"      "Microsoft.Teams"              "Communication")
     (App "WhatsApp"             "WhatsApp.WhatsApp"            "Communication")
 
-    # Productivity
     (App "LibreOffice"          "TheDocumentFoundation.LibreOffice" "Productivity")
     (App "Adobe Acrobat Reader" "Adobe.Acrobat.Reader.64-bit"  "Productivity")
     (App "Notion"               "Notion.Notion"                "Productivity")
@@ -253,37 +229,24 @@ $AppCatalog = @(
     (App "Sumatra PDF"          "SumatraPDF.SumatraPDF"        "Productivity")
     (App "Joplin"               "Joplin.Joplin"                "Productivity")
 
-    # Security & Privacy
     (App "Malwarebytes"         "Malwarebytes.Malwarebytes"    "Security & Privacy")
     (App "Bitwarden"            "Bitwarden.Bitwarden"          "Security & Privacy")
     (App "KeePass"              "DominikReichl.KeePass"        "Security & Privacy")
 
-    # Gaming
     (App "Steam"                "Valve.Steam"                  "Gaming")
     (App "Epic Games Launcher"  "EpicGames.EpicGamesLauncher"  "Gaming")
     (App "GOG Galaxy"           "GOG.Galaxy"                   "Gaming")
 
-    # Cloud Storage
     (App "Google Drive"         "Google.GoogleDrive"           "Cloud Storage")
     (App "Dropbox"              "Dropbox.Dropbox"              "Cloud Storage")
 
-    # Networking
     (App "Wireshark"            "WiresharkFoundation.Wireshark" "Networking")
     (App "PuTTY"                "PuTTY.PuTTY"                  "Networking")
     (App "WinSCP"                "WinSCP.WinSCP"                "Networking")
 
-    # Virtualization
     (App "VirtualBox"           "Oracle.VirtualBox"            "Virtualization")
 )
 
-# ============================================================================
-# Tweak engine - every tweak exposes GetState / Plan / Apply / Restore so
-# "Undo" restores the EXACT previous value instead of a guessed default, and
-# Dry Run can describe the change (Plan) without performing it (Apply).
-# ============================================================================
-# Returns a rich snapshot: whether the value existed, its value, AND its
-# original RegistryValueKind - so Restore can recreate it with the EXACT
-# original type instead of whatever type the tweak happens to use.
 function Get-RegValueOrNull($Path, $Name) {
     if (Test-Path $Path) {
         try {
@@ -298,8 +261,6 @@ function Get-RegValueOrNull($Path, $Name) {
     return @{ Exists = $false; Value = $null; Kind = $null }
 }
 
-# $PrevState is the rich snapshot from Get-RegValueOrNull (possibly round-tripped
-# through JSON, so it may arrive as a PSCustomObject - hence the conversion).
 function Set-RegValueOrRemove($Path, $Name, $PrevState, $FallbackType) {
     $PrevState = ConvertTo-HashtableDeep $PrevState
     if (-not $PrevState.Exists) {
@@ -311,8 +272,6 @@ function Set-RegValueOrRemove($Path, $Name, $PrevState, $FallbackType) {
     Set-ItemProperty -Path $Path -Name $Name -Value $PrevState.Value -Type $type
 }
 
-# Builds a tweak whose state is a flat set of registry values. Each target:
-# @{ Path=...; Name=...; Type=...; Value=<value to set when applied> }
 function New-RegTweak($Key, $Name, [array]$Targets) {
     [PSCustomObject]@{
         Key  = $Key
@@ -322,7 +281,6 @@ function New-RegTweak($Key, $Name, [array]$Targets) {
             foreach ($t in $Targets) { $state["$($t.Path)|$($t.Name)"] = Get-RegValueOrNull -Path $t.Path -Name $t.Name }
             return $state
         }.GetNewClosure()
-        # Dry Run: describes each registry change (current value -> new value).
         Plan = {
             param($State)
             $State = ConvertTo-HashtableDeep $State
@@ -402,7 +360,6 @@ $TweakCatalog = @(
         @{ Path="HKCU:\Control Panel\Accessibility\StickyKeys"; Name="Flags"; Type="String"; Value="58" }
     ))
 
-    # ---- Custom (non-registry-only) tweaks: exact state capture per case ----
     [PSCustomObject]@{
         Key = "DisableSysMain"
         Name = "Disable SysMain / Superfetch (commonly suggested for SSDs; effect varies by system)"
@@ -430,8 +387,6 @@ $TweakCatalog = @(
         Key = "DisableHibernation"
         Name = "Disable Hibernation (frees the hiberfil.sys disk space; also removes hibernate/fast-startup options)"
         GetState = {
-            # Don't assume "on" when the registry value is missing - ask Windows
-            # directly whether hibernation is actually available right now.
             $a = (powercfg /a) -join "`n"
             $wasAvailable = $a -match "Hibernate"
             @{ WasAvailable = [bool]$wasAvailable }
@@ -471,8 +426,6 @@ $TweakCatalog = @(
                 $createdGuid = $Matches[1]
                 powercfg -setactive $createdGuid
             }
-            # Returned value is merged into this tweak's saved state so Restore
-            # knows exactly which duplicated plan to clean up.
             return @{ CreatedGuid = $createdGuid }
         }
         Restore = {
@@ -531,7 +484,6 @@ $TweakCatalog = @(
     }
 )
 
-# Categorize tweaks for profiles. Profiles only select checkboxes; they never apply changes.
 function Get-TweakCategory([string]$Key) {
     $routine = @('ShowFileExtensions','ShowHiddenFiles','ShowThisPCOnDesktop','DarkMode','AlignTaskbarLeft','ClassicRightClickMenu','DisableStickyKeysPrompt')
     $performance = @('DisableGameBar','DisableBackgroundApps','DisableFastStartup','DisableStartupDelay','DisableSysMain','DisableHibernation','UltimatePerformancePlan')
@@ -540,10 +492,6 @@ function Get-TweakCategory([string]$Key) {
     return 'Advanced'
 }
 
-# ============================================================================
-# Uninstall tab: enumerate installed programs, run their real uninstaller,
-# then SAFELY propose leftover files/folders for review (never auto-delete).
-# ============================================================================
 function Get-InstalledPrograms {
     $uninstallPaths = @(
         "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
@@ -567,8 +515,6 @@ function Get-InstalledPrograms {
         } | Sort-Object DisplayName
 }
 
-# Folder names that are NEVER offered for removal: checked against the candidate
-# itself AND every folder below its allowed root.
 $ProtectedFolderNames = @(
     "Documents","Desktop","Pictures","Videos","Music","Downloads",
     "OneDrive","Dropbox","Backup","Backups","Important","Personal","Projects",
@@ -587,7 +533,6 @@ function Test-PathUnder([string]$Child, [string]$Parent) {
     return $Child.StartsWith($Parent.TrimEnd('\') + '\', [System.StringComparison]::OrdinalIgnoreCase)
 }
 
-# The ONLY places a leftover may live. Anything outside is refused.
 function Get-LeftoverAllowedRoots {
     $r = @($env:ProgramData, $env:LOCALAPPDATA, $env:APPDATA, $env:ProgramFiles, ${env:ProgramFiles(x86)})
     if ($env:LOCALAPPDATA) { $r += (Join-Path $env:LOCALAPPDATA "Programs") }
@@ -602,8 +547,6 @@ function Get-UserDataFolders {
     @($list | ForEach-Object { Get-NormalizedPath $_ } | Where-Object { $_ } | Select-Object -Unique)
 }
 
-# Single gatekeeper used BOTH when proposing a leftover and again immediately
-# before touching it. Returns @{ Safe = $true/$false; Reason = ... }.
 function Test-SafeLeftoverPath {
     param([string]$Path, [array]$OtherInstallLocations = @())
 
@@ -665,18 +608,13 @@ function Find-LeftoverPaths {
     param($App, [array]$OtherInstallLocations = @())
 
     $nameGuess = ($App.DisplayName -replace '[^\w\s]', '').Trim()
-    # EXACT folder-name match only (with or without spaces). No prefix/suffix/
-    # "contains" matching and no publisher matching - those are how a different
-    # program's data gets flagged by mistake.
     $variants = @($nameGuess, ($nameGuess -replace '\s', '')) | Where-Object { $_ -and $_.Length -ge 4 } | Select-Object -Unique
 
     $candidates = @()
 
-    # 1) The authoritative path: exactly what the registry says it installed to.
     $loc = if ($App.InstallLocation) { Get-NormalizedPath $App.InstallLocation } else { $null }
     if ($loc -and (Test-Path -LiteralPath $loc -PathType Container)) { $candidates += $loc }
 
-    # 2) Per-user/app DATA folders, exact name only.
     if ($variants) {
         $dataRoots = @($env:ProgramData, $env:LOCALAPPDATA, $env:APPDATA, (Join-Path $env:LOCALAPPDATA "Programs")) |
             Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique
@@ -703,9 +641,6 @@ function Find-LeftoverPaths {
     }
 }
 
-# Removes ONE leftover folder. Re-validates right before acting (the folder may
-# have changed since it was listed). Default = move to a quarantine folder that
-# can be restored by hand; permanent deletion only when explicitly requested.
 function Remove-LeftoverSafely {
     param([string]$Path, [array]$OtherInstallLocations = @(), [bool]$Permanent = $false)
 
@@ -743,13 +678,6 @@ function Remove-LeftoverSafely {
     }
 }
 
-# Runs an uninstall string from the registry under strict rules:
-#  - commands with chaining/download/encoded-PowerShell patterns are REFUSED
-#  - it must resolve to a real .exe file (no cmd /c fallback, ever)
-#  - msiexec /I (modify/repair) is converted to /X (uninstall)
-#  - an unsigned or invalidly signed executable needs explicit confirmation
-#  - the real exit code decides success (0, 3010 and 1641 count as success)
-# In Dry Run it performs the same analysis but NEVER executes anything.
 function Invoke-UninstallCommand {
     param([string]$RawCommand)
 
@@ -791,7 +719,6 @@ function Invoke-UninstallCommand {
     }
 
     if ((Split-Path $resolvedExe -Leaf) -ieq "msiexec.exe") {
-        # Some registry entries use /I{GUID}, which opens repair/modify instead of removing.
         $argString = $argString -replace '(?i)(^|\s)/I(?=\s*\{)', '$1/X'
     }
 
@@ -822,7 +749,6 @@ function Invoke-UninstallCommand {
             Start-Process -FilePath $resolvedExe -Wait -NoNewWindow -PassThru
         }
         $result.ExitCode = $proc.ExitCode
-        # 0 = success; 3010 / 1641 = success but a reboot is required (common for MSI)
         $result.Success = ($proc.ExitCode -in 0, 3010, 1641)
         $result.Message = "Exit code: $($proc.ExitCode)"
     } catch {
@@ -831,13 +757,10 @@ function Invoke-UninstallCommand {
     return $result
 }
 
-# ============================================================================
-# WPF UI
-# ============================================================================
 [xml]$Xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="STwaek - App Installer, System Tweaks, Uninstaller &amp; Security"
+        Title="STweak - App Installer, System Tweaks, Uninstaller &amp; Security"
         Height="820" Width="1180" MinHeight="700" MinWidth="980" WindowStartupLocation="CenterScreen"
         Background="#17191F">
     <Window.Resources>
@@ -863,7 +786,7 @@ function Invoke-UninstallCommand {
         </Style>
     </Window.Resources>
     <DockPanel>
-        <TextBlock DockPanel.Dock="Top" Text="STwaek" FontSize="26" FontWeight="Bold"
+        <TextBlock DockPanel.Dock="Top" Text="STweak" FontSize="26" FontWeight="Bold"
                    Foreground="#7DD3FC" Margin="14,12,0,0"/>
         <TextBlock DockPanel.Dock="Top" Text="App manager  •  Reversible system tweaks  •  Uninstaller  •  Windows Security"
                    FontSize="11" Foreground="#AAAAAA" Margin="14,0,0,6" TextWrapping="Wrap"/>
@@ -984,7 +907,6 @@ function Write-Log {
     $LogBox.Dispatcher.Invoke([System.Windows.Threading.DispatcherPriority]::Background, [action]{})
 }
 
-# Dry Run toggle: updates the banner and tells the user which mode is active.
 function Update-DryRunBanner {
     if (Test-DryRun) {
         $TxtDryRunBanner.Text = "DRY RUN is ON  |  Safe preview mode: actions are simulated and no system changes are made."
@@ -999,10 +921,6 @@ function Update-DryRunBanner {
 $ChkDryRun.Add_Checked({ Update-DryRunBanner })
 $ChkDryRun.Add_Unchecked({ Update-DryRunBanner })
 
-# ----------------------------------------------------------------------------
-# Leftover review dialog - per-item checkboxes, nothing is auto-selected
-# blindly; shows size/file count so the user can judge each one.
-# ----------------------------------------------------------------------------
 function Show-LeftoverReviewDialog {
     param([array]$Items)
 
@@ -1075,7 +993,6 @@ function Show-LeftoverReviewDialog {
     return $script:LeftoverDialogResult
 }
 
-# Build Apps tab grouped by category
 $appCheckboxMap = @{}
 $categories = $AppCatalog | ForEach-Object { $_.Cat } | Sort-Object -Unique
 foreach ($cat in $categories) {
@@ -1094,7 +1011,6 @@ foreach ($cat in $categories) {
     $AppsPanel.Children.Add($group) | Out-Null
 }
 
-# Build Tweaks tab: profiles only preselect options; applying still requires a separate confirmation.
 $tweakCheckboxMap = @{}
 $profileRow = New-Object System.Windows.Controls.StackPanel
 $profileRow.Orientation = 'Horizontal'
@@ -1134,9 +1050,6 @@ foreach ($cat in $groupOrder) {
     [void]$TweaksPanel.Children.Add($tweakGroup)
 }
 
-# ----------------------------------------------------------------------------
-# Uninstall tab logic
-# ----------------------------------------------------------------------------
 $script:AllPrograms = @()
 
 function Apply-UninstallFilter {
@@ -1174,8 +1087,6 @@ $BtnUninstallSelected.Add_Click({
         Write-Log "[DRY RUN] Simulating uninstall of $($selected.Count) application(s). Nothing will be removed."
     }
 
-    # Paths belonging to apps NOT being uninstalled right now - never offered
-    # as "leftovers" even if a name happens to match.
     $selectedNames = $selected | ForEach-Object { $_.DisplayName }
     $otherInstallLocations = @(
         $script:AllPrograms |
@@ -1202,8 +1113,6 @@ $BtnUninstallSelected.Add_Click({
             continue
         }
 
-        # The leftover scan only READS the disk, so it is safe to run in Dry Run
-        # as well - it shows exactly which folders would be offered afterwards.
         $leftovers = @(Find-LeftoverPaths -App $app -OtherInstallLocations $otherInstallLocations)
         if ($leftovers.Count -gt 0) {
             Write-Log "Found $($leftovers.Count) possible leftover folder(s) for $($app.DisplayName)."
@@ -1240,10 +1149,6 @@ $BtnUninstallSelected.Add_Click({
     Update-UninstallGrid
 })
 
-# ----------------------------------------------------------------------------
-# Security tab logic (Microsoft Defender) - background jobs keep the UI responsive.
-# The indeterminate progress bar is visible for every long-running security action.
-# ----------------------------------------------------------------------------
 function Set-SecurityBusy {
     param([bool]$Busy, [string]$Message = '')
     $SecurityProgress.Visibility = if ($Busy) { 'Visible' } else { 'Collapsed' }
@@ -1401,9 +1306,6 @@ $BtnRemoveThreats.Add_Click({
     }
 })
 
-# ----------------------------------------------------------------------------
-# Install / Tweak / Undo button actions
-# ----------------------------------------------------------------------------
 function Test-WingetInstalled($Id) {
     try {
         & winget list --id $Id -e --accept-source-agreements 2>&1 | Out-Null
@@ -1472,8 +1374,6 @@ $BtnTweak.Add_Click({
         $tweak = $tweakCheckboxMap[$cb]
 
         if ($dry) {
-            # Reading current state is harmless; Apply is never called and
-            # nothing is written to the action log.
             Write-Log "[DRY RUN] $($tweak.Name)"
             try {
                 $state = & $tweak.GetState
@@ -1485,9 +1385,6 @@ $BtnTweak.Add_Click({
         }
 
         Write-Log "Applying tweak: $($tweak.Name) ..."
-        # Capture AND persist the pre-tweak state BEFORE calling Apply. If Apply
-        # throws partway through a multi-step change, the undo record for what
-        # was already changed still exists - it's not lost in the catch block.
         $state = & $tweak.GetState
         Add-AppliedTweak -tweakKey $tweak.Key -displayName $tweak.Name -state $state
         try {
@@ -1502,8 +1399,6 @@ $BtnTweak.Add_Click({
     else { Write-Log "Done applying selected tweaks. Some tweaks may require sign-out/restart to take visible effect." }
 })
 
-# True when the CURRENT state (from GetState) matches what was saved before the
-# tweak was applied. Only keys present in both are compared.
 function Test-StateRestored($Saved, $Current) {
     $s = ConvertTo-HashtableDeep $Saved
     $c = ConvertTo-HashtableDeep $Current
@@ -1527,7 +1422,7 @@ $BtnUndo.Add_Click({
 
     if (-not $dry) {
         $confirm = [System.Windows.MessageBox]::Show(
-            "This will uninstall every app STwaek installed and restore every tweak STwaek applied back to its exact previous value. It will NOT touch anything else on the system. Anything that cannot be undone successfully stays in the action log so you can retry. Continue?",
+            "This will uninstall every app STweak installed and restore every tweak STweak applied back to its exact previous value. It will NOT touch anything else on the system. Anything that cannot be undone successfully stays in the action log so you can retry. Continue?",
             "Undo Everything This Tool Did", "YesNo", "Warning")
         if ($confirm -ne "Yes") { return }
     }
@@ -1564,7 +1459,6 @@ $BtnUndo.Add_Click({
             if ($proc.ExitCode -eq 0) {
                 $removed = $true
             } elseif ($proc.ExitCode -eq -1978335212) {
-                # 0x8A150014: no installed package matches - already gone
                 Write-Log "$($app.name) was not installed any more."
                 $removed = $true
             } else {
@@ -1612,7 +1506,7 @@ $BtnUndo.Add_Click({
     else { Write-Log "Undo finished, but $kept item(s) could not be reverted and remain in the action log. Run Undo again after fixing the problem." }
 })
 
-Write-Log "STwaek ready. $($AppCatalog.Count) apps and $($TweakCatalog.Count) tweaks loaded."
+Write-Log "STweak ready. $($AppCatalog.Count) apps and $($TweakCatalog.Count) tweaks loaded."
 Write-Log "Action log stored at: $LogFile"
 Write-Log "Dry Run is ON by default. No action log is created until a real change needs to be recorded."
 
