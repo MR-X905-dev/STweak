@@ -493,44 +493,50 @@ function Get-TweakCategory([string]$Key) {
 }
 
 function Get-InstalledPrograms {
+
     $uninstallPaths = @(
         "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
         "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
         "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
     )
-    $raw = foreach ($p in $uninstallPaths) { Get-ItemProperty -Path $p -ErrorAction SilentlyContinue }
-    $raw |
-        Where-Object {
-            $hasDisplayName = $_.PSObject.Properties.Name -contains "DisplayName"
-            $hasSystemComponent = $_.PSObject.Properties.Name -contains "SystemComponent"
-            $hasUninstallString = $_.PSObject.Properties.Name -contains "UninstallString"
-            $hasQuietUninstallString = $_.PSObject.Properties.Name -contains "QuietUninstallString"
 
-            (
-                $hasDisplayName -and
-                -not [string]::IsNullOrWhiteSpace([string]$_.DisplayName)
-            ) -and
-            (
-                -not $hasSystemComponent -or
-                -not [bool]$_.SystemComponent
-            ) -and
-            (
-                ($hasUninstallString -and $_.UninstallString) -or
-                ($hasQuietUninstallString -and $_.QuietUninstallString)
-            )
-        } |
-        Group-Object DisplayName |
-        ForEach-Object {
-            $e = $_.Group[0]
-            [PSCustomObject]@{
-                DisplayName          = $e.DisplayName
-                Publisher            = $e.Publisher
-                DisplayVersion       = $e.DisplayVersion
-                InstallLocation      = $e.InstallLocation
-                UninstallString      = $e.UninstallString
-                QuietUninstallString = $e.QuietUninstallString
+    foreach ($path in $uninstallPaths) {
+        try {
+            foreach ($item in (Get-ItemProperty -Path $path -ErrorAction SilentlyContinue)) {
+
+                $props = @($item.PSObject.Properties.Name)
+
+                if ($props -notcontains "DisplayName") { continue }
+
+                $name = [string]$item.DisplayName
+                if ([string]::IsNullOrWhiteSpace($name)) { continue }
+
+                if ($props -contains "SystemComponent" -and [bool]$item.SystemComponent) {
+                    continue
+                }
+
+                $uninstall = if ($props -contains "UninstallString") { [string]$item.UninstallString } else { "" }
+                $quiet = if ($props -contains "QuietUninstallString") { [string]$item.QuietUninstallString } else { "" }
+
+                if ([string]::IsNullOrWhiteSpace($uninstall) -and [string]::IsNullOrWhiteSpace($quiet)) {
+                    continue
+                }
+
+                [PSCustomObject]@{
+                    DisplayName = $name
+                    Publisher = if ($props -contains "Publisher") { [string]$item.Publisher } else { "" }
+                    DisplayVersion = if ($props -contains "DisplayVersion") { [string]$item.DisplayVersion } else { "" }
+                    InstallLocation = if ($props -contains "InstallLocation") { [string]$item.InstallLocation } else { "" }
+                    UninstallString = $uninstall
+                    QuietUninstallString = $quiet
+                    RegistryPath = $item.PSPath
+                }
             }
-        } | Sort-Object DisplayName
+        }
+        catch {
+            continue
+        }
+    }
 }
 
 $ProtectedFolderNames = @(
