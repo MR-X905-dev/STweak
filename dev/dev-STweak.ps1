@@ -501,8 +501,24 @@ function Get-InstalledPrograms {
     $raw = foreach ($p in $uninstallPaths) { Get-ItemProperty -Path $p -ErrorAction SilentlyContinue }
     $raw |
         Where-Object {
-            $_.DisplayName -and
-            (-not ($_.PSObject.Properties.Name -contains "SystemComponent") -or -not $_.SystemComponent) -and ($_.UninstallString -or $_.QuietUninstallString) } |
+            $hasDisplayName = $_.PSObject.Properties.Name -contains "DisplayName"
+            $hasSystemComponent = $_.PSObject.Properties.Name -contains "SystemComponent"
+            $hasUninstallString = $_.PSObject.Properties.Name -contains "UninstallString"
+            $hasQuietUninstallString = $_.PSObject.Properties.Name -contains "QuietUninstallString"
+
+            (
+                $hasDisplayName -and
+                -not [string]::IsNullOrWhiteSpace([string]$_.DisplayName)
+            ) -and
+            (
+                -not $hasSystemComponent -or
+                -not [bool]$_.SystemComponent
+            ) -and
+            (
+                ($hasUninstallString -and $_.UninstallString) -or
+                ($hasQuietUninstallString -and $_.QuietUninstallString)
+            )
+        } |
         Group-Object DisplayName |
         ForEach-Object {
             $e = $_.Group[0]
