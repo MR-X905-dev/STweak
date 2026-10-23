@@ -1,45 +1,55 @@
 # STweak 🚀
 
-A lightweight, open-source Windows App Installer & System Tweak Tool inspired by Chris Titus Tech's WinUtil.
+**A single-file PowerShell toolkit for Windows: apps, reversible tweaks, deep uninstall, cleanup and security in one dashboard.**
 
----
+![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-5391FE?logo=powershell&logoColor=white) ![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6?logo=windows&logoColor=white) ![License](https://img.shields.io/badge/license-MIT-green)
 
-## ✨ Features
+One `.ps1` file with a WPF interface. Changes are backed up first, deletions go to quarantine, and no telemetry is collected.
 
-- **App Installer:** Easily install your favorite applications categorized by utility (Browsers, Developer Tools, Utilities, Media, etc.) via `winget`.
-- **Safe & Reversible Tweaks:** Apply commonly-recommended and safe system optimizations (such as telemetry reduction, dark mode, file extensions) that can be easily reverted.
-- **Full Uninstaller (Deep Clean):** Select one or more installed programs and remove them completely along with their leftover files and folders.
-- **Action Log & Undo:** Tracks installed apps and applied tweaks in a local log file, allowing you to undo changes cleanly.
-- **Privacy Focused:** Completely standalone with **no remote-control or remote-screen features** included.
+## What's inside
 
----
+| Page | What it does |
+|---|---|
+| 🏠 **Home** | Health check, live CPU/RAM/disk graphs, quick actions |
+| 📦 **App Manager** | 142 apps in 10 categories via `winget`, plus upgrade scanning |
+| 🎛️ **System Tweaks** | 59 reversible tweaks in 9 categories, with 4 presets |
+| 🧨 **Deep Uninstall** | Remove a program, then its leftover folders, registry keys, services, tasks, shortcuts and Run entries |
+| 🧹 **Smart Cleaner** | Measure and clear 9 junk locations (temp, update and shader caches, Recycle Bin) |
+| 🧱 **Bloatware** | Remove built-in Store (AppX) packages, optionally for all users |
+| 🛡️ **Security** | Defender, firewall, UAC and Secure Boot report, plus signature update and scans |
+| ↩️ **Safe Restore** | Action history with one-click undo |
+| 🗄️ **Quarantine** | Restore or purge deleted leftovers |
+| 📝 **Activity Log** | In-app log viewer and data-folder shortcuts |
 
-## 💻 Manual Installation & Use
+## Requirements
 
-1. Download or clone this repository.
-2. Right-click the launcher script (`launcher.bat`) and select **Run as Administrator**.
-3. Use the tabs in the graphical interface to install apps, apply tweaks, or clean your system.
+Windows 10/11 (x64) · PowerShell 5.1+ · Administrator · `winget` for the App Manager.
 
----
+## Quick start
 
-## 🛠️ Quick Start
-
-Run the following command in PowerShell as an Administrator:
+Run in an **elevated** PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/MR-X905-dev/STweak/main/STweak.ps1 | iex
 ```
 
+Or clone the repo and run `launcher.bat` (self-elevates). Manual: `powershell.exe -ExecutionPolicy Bypass -File .\STweak.ps1`
 
-## 🧪 Run the Development Version
+Dev build (may be unstable): `.../refs/heads/main/dev/dev-STweak.ps1`
 
-Want to try the latest development features? Run PowerShell as Administrator and execute:
+## Presets
 
-```powershell
-irm https://raw.githubusercontent.com/MR-X905-dev/STweak/refs/heads/main/dev/dev-STweak.ps1 | iex
-```
+**Safe Starter** (low-risk baseline) · **Privacy Max** (telemetry and tracking off) · **Performance** (throttling, Game DVR, visual effects) · **Developer** (hidden files, long paths, dark mode, SMB1 off).
 
+## Safety
 
-> ⚠️ **Warning:** The development version may contain bugs or unfinished features. Review the script before running it.
+Registry keys are exported to `.reg` and scheduled tasks to XML before writing. Deleted items move to `%ProgramData%\STweak\Quarantine` (Recycle Bin fallback) with a manifest and can be restored. Destructive actions ask for confirmation, and applied tweaks revert individually or all at once.
 
+## Troubleshooting
 
+- `running scripts is disabled` → use `launcher.bat` or `-ExecutionPolicy Bypass`
+- `must run as Administrator` with `irm | iex` → start an elevated shell first
+- Installs fail → check `winget --version`, then `winget source update`
+- Self-test: add `-ValidateOnly` → `Tweaks: 59   Apps: 142   Presets: 4`
+
+**MIT License** — see [LICENSE](LICENSE). Use only on machines you own or administer.
