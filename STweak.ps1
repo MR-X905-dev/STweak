@@ -2,7 +2,8 @@
 #Requires -Version 5.1
 
 param(
-    [switch]$ValidateOnly
+    [switch]$ValidateOnly,
+    [switch]$SelfTest
 )
 
 Set-StrictMode -Version Latest
@@ -17,7 +18,41 @@ function Test-IsAdmin {
     } catch { return $false }
 }
 
-if ((-not $ValidateOnly) -and (-not (Test-IsAdmin))) {
+function Set-RestrictedDataAcl {
+    param([string]$Path, [switch]$NoUsersRead)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $false }
+    $ok = $false
+    try {
+        $acl = New-Object System.Security.AccessControl.DirectorySecurity
+        $acl.SetAccessRuleProtection($true, $false)
+        $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+        $prop = [System.Security.AccessControl.PropagationFlags]::None
+        $allow = [System.Security.AccessControl.AccessControlType]::Allow
+        $ids = @(
+            @{ Sid = 'S-1-5-18';     Rights = 'FullControl' },   # LOCAL SYSTEM
+            @{ Sid = 'S-1-5-32-544'; Rights = 'FullControl' }    # Administrators
+        )
+        if (-not $NoUsersRead) { $ids += @{ Sid = 'S-1-5-32-545'; Rights = 'ReadAndExecute' } } # Users: read-only
+        foreach ($i in $ids) {
+            $sid = New-Object System.Security.Principal.SecurityIdentifier($i.Sid)
+            $ace = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, $i.Rights, $inherit, $prop, $allow)
+            [void]$acl.AddAccessRule($ace)
+        }
+        Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+        $ok = $true
+    } catch { $ok = $false }
+    if (-not $ok) {
+        try {
+            $grant = @('*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F')
+            if (-not $NoUsersRead) { $grant += '*S-1-5-32-545:(OI)(CI)RX' }
+            & icacls.exe $Path /inheritance:r /grant:r $grant 2>&1 | Out-Null
+            $ok = ($LASTEXITCODE -eq 0)
+        } catch { $ok = $false }
+    }
+    return $ok
+}
+
+if ((-not $ValidateOnly) -and (-not $SelfTest) -and (-not (Test-IsAdmin))) {
     if ([string]::IsNullOrWhiteSpace($PSCommandPath) -or -not (Test-Path -LiteralPath $PSCommandPath)) {
         Write-Host 'STweak must run as Administrator. Save this file as .ps1 and run it, or launch it from an elevated PowerShell window.' -ForegroundColor Red
         Start-Sleep -Seconds 8
@@ -48,15 +83,58 @@ $ManifestFile  = Join-Path $QuarantineDir 'manifest.json'
 $RegBackupDir  = Join-Path $RootDir 'RegBackups'
 $TaskBackupDir = Join-Path $RootDir 'TaskBackups'
 $BgDir         = Join-Path $RootDir 'Bg'
+$script:UsingTempState = $false
+
+# Check-only modes must not touch or need write access to the real ProgramData state.
+if ($ValidateOnly -or $SelfTest) {
+    $tempState = Join-Path $env:TEMP ('STweakState_' + $PID)
+    try { if (Test-Path -LiteralPath $tempState) { Remove-Item -LiteralPath $tempState -Recurse -Force -ErrorAction SilentlyContinue } } catch { }
+    $RootDir       = $tempState
+    $LogFile       = Join-Path $RootDir 'actions.json'
+    $TextLogFile   = Join-Path $RootDir 'stweak.log'
+    $QuarantineDir = Join-Path $RootDir 'Quarantine'
+    $ManifestFile  = Join-Path $QuarantineDir 'manifest.json'
+    $RegBackupDir  = Join-Path $RootDir 'RegBackups'
+    $TaskBackupDir = Join-Path $RootDir 'TaskBackups'
+    $BgDir         = Join-Path $RootDir 'Bg'
+    $script:UsingTempState = $true
+}
 
 foreach ($d in @($RootDir, $QuarantineDir, $RegBackupDir, $TaskBackupDir, $BgDir)) {
     if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
 }
 
+# The elevated app owns this state. Standard users may read the log but never change anything.
+if (-not $script:UsingTempState) {
+    $null = Set-RestrictedDataAcl -Path $RootDir
+    foreach ($sensitive in @($QuarantineDir, $RegBackupDir, $TaskBackupDir)) {
+        if (Test-Path -LiteralPath $sensitive) { $null = Set-RestrictedDataAcl -Path $sensitive -NoUsersRead }
+    }
+}
+
+function Remove-TempStateIfAny {
+    if (-not $script:UsingTempState) { return }
+    try {
+        if (Test-Path -LiteralPath $RootDir) {
+            if (Get-Command -Name 'Remove-TreeSafely' -CommandType Function -ErrorAction SilentlyContinue) {
+                $null = Remove-TreeSafely -Path $RootDir
+            }
+            if (Test-Path -LiteralPath $RootDir) { Remove-Item -LiteralPath $RootDir -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+    } catch { }
+}
+
 function Write-FileLog {
     param([string]$Text)
     try {
-        $line = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') + '  ' + $Text
+        # Keep one line per event: a path or message with CR/LF must not forge extra log entries.
+        $clean = ([string]$Text) -replace "[\r\n]+", ' '
+        if ($clean.Length -gt 2000) { $clean = $clean.Substring(0, 2000) + '...' }
+        $line = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') + '  ' + $clean
+        $fi = New-Object System.IO.FileInfo($TextLogFile)
+        if ($fi.Exists -and ($fi.Length -gt 5MB)) {
+            try { Move-Item -LiteralPath $TextLogFile -Destination ($TextLogFile + '.1') -Force -ErrorAction Stop } catch { }
+        }
         Add-Content -LiteralPath $TextLogFile -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue
     } catch { }
 }
@@ -218,13 +296,44 @@ function Set-RegValueOrRemove {
     if ($ps.ContainsKey('Value'))  { $value  = $ps['Value'] }
     if ($ps.ContainsKey('Kind'))   { $kind   = $ps['Kind'] }
     if (-not $exists) {
-        Remove-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue
+        Remove-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction SilentlyContinue
         return
     }
-    if (-not (Test-Path -LiteralPath $Path)) { New-Item -Path $Path -Force | Out-Null }
+    if (-not (Test-Path -LiteralPath $Path)) {
+        try { New-Item -Path $Path -Force -ErrorAction Stop | Out-Null } catch { }
+    }
     $type = $FallbackType
     if ($kind -and $kind -ne 'None') { $type = [string]$kind }
-    Set-ItemProperty -Path $Path -Name $Name -Value $value -Type $type
+    Set-ItemProperty -LiteralPath $Path -Name $Name -Value $value -Type $type
+}
+
+function Get-DefenderSettingRestore {
+    param([string]$Name, $SavedValue)
+    $v = -1
+    if ($null -ne $SavedValue) {
+        try { $v = [int]$SavedValue } catch { $v = -1 }
+    }
+    if ($v -lt 0) {
+        throw ('The original ' + $Name + ' value could not be read when this tweak was applied, so STweak will not guess. Nothing was changed - set it manually in Windows Security.')
+    }
+    switch ($v) {
+        0 { return 'Disabled' }
+        1 { return 'None' }
+        2 { return 'AuditMode' }
+    }
+    throw ('Unsupported ' + $Name + ' value: ' + $v + '. Nothing was changed.')
+}
+
+function Get-DefenderSettingStatus {
+    param($SavedValue)
+    $v = -1
+    if ($null -ne $SavedValue) {
+        try { $v = [int]$SavedValue } catch { $v = -1 }
+    }
+    if ($v -eq 1) { return 'Applied' }
+    if ($v -eq 2) { return 'Partial' }
+    if ($v -eq 0) { return 'NotApplied' }
+    return 'Unknown'
 }
 
 function New-EmptyActionLog {
@@ -802,7 +911,11 @@ $p = @{
         return $null
     }
     Restore = {
-        & powercfg.exe /hibernate on | Out-Null
+        param($State)
+        $s = ConvertTo-HashtableDeep $State
+        if ([bool]$s['HiberfilExists']) {
+            & powercfg.exe /hibernate on | Out-Null
+        }
     }
     GetStatus = {
         if (Test-Path -LiteralPath (Join-Path $env:SystemDrive 'hiberfil.sys')) { return 'NotApplied' }
@@ -915,14 +1028,13 @@ $p = @{
     Restore = {
         param($State)
         $s = ConvertTo-HashtableDeep $State
-        $v = [int]$s['PUA']
-        if ($v -eq 2) { Set-MpPreference -PUAProtection AuditMode -ErrorAction SilentlyContinue }
-        else          { Set-MpPreference -PUAProtection Disabled -ErrorAction SilentlyContinue }
+        $target = Get-DefenderSettingRestore -Name 'PUA Protection' -SavedValue $s['PUA']
+        if ($target -eq 'None') { return }
+        Set-MpPreference -PUAProtection $target -ErrorAction Stop
     }
     GetStatus = {
         try { $v = [int](Get-MpPreference).PUAProtection } catch { return 'Unknown' }
-        if ($v -eq 0) { return 'NotApplied' }
-        return 'Applied'
+        return (Get-DefenderSettingStatus -SavedValue $v)
     }
 }
 [void]$TweakCatalog.Add((New-CmdTweak @p))
@@ -1015,14 +1127,13 @@ $p = @{
     Restore = {
         param($State)
         $s = ConvertTo-HashtableDeep $State
-        $v = [int]$s['CFA']
-        if ($v -eq 2) { Set-MpPreference -EnableControlledFolderAccess AuditMode -ErrorAction SilentlyContinue }
-        else          { Set-MpPreference -EnableControlledFolderAccess Disabled -ErrorAction SilentlyContinue }
+        $target = Get-DefenderSettingRestore -Name 'Controlled Folder Access' -SavedValue $s['CFA']
+        if ($target -eq 'None') { return }
+        Set-MpPreference -EnableControlledFolderAccess $target -ErrorAction Stop
     }
     GetStatus = {
         try { $v = [int](Get-MpPreference).EnableControlledFolderAccess } catch { return 'Unknown' }
-        if ($v -eq 0) { return 'NotApplied' }
-        return 'Applied'
+        return (Get-DefenderSettingStatus -SavedValue $v)
     }
 }
 [void]$TweakCatalog.Add((New-CmdTweak @p))
@@ -1257,11 +1368,33 @@ function Start-BgOperation {
         [string]$Title,
         [Parameter(Mandatory = $true)][scriptblock]$Body,
         [object]$Payload = $null,
-        [scriptblock]$OnDone = $null
+        [scriptblock]$OnDone = $null,
+        [int]$TimeoutSeconds = 0,
+        [switch]$NoQueue
     )
     if ($script:BgJob) {
-        [System.Windows.MessageBox]::Show('Another background operation is still running. Wait for it to finish.', 'STweak', 'OK', 'Warning') | Out-Null
-        return $false
+        $state = 'Unknown'
+        try { $state = $script:BgJob.State.ToString() } catch { $state = 'Unknown' }
+        if (@('Running', 'NotStarted', 'Blocked') -contains $state) {
+            if ($NoQueue -or $script:BgPending) {
+                [System.Windows.MessageBox]::Show('Another background operation is already running or queued. Wait for it to finish.', 'STweak', 'OK', 'Warning') | Out-Null
+                return $false
+            }
+            $script:BgPending = @{
+                Kind           = $Kind
+                Title          = $Title
+                Body           = $Body
+                Payload        = $Payload
+                OnDone         = $OnDone
+                TimeoutSeconds = $TimeoutSeconds
+            }
+            if ($script:TxtBgState) { $script:TxtBgState.Text = 'Queued: ' + $Title }
+            Write-Log ('Queued: ' + $Title + '  (waiting for: ' + $script:BgTitle + ')')
+            return $true
+        }
+        Write-Log ('Discarding a finished background job before starting: ' + $Title)
+        try { Remove-Job -Job $script:BgJob -Force -ErrorAction SilentlyContinue } catch { }
+        $script:BgJob = $null
     }
     $log = Join-Path $BgDir ($Kind + '_' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.log')
     $jsonPath = $log + '.json'
@@ -1290,6 +1423,11 @@ function Start-BgOperation {
     $script:BgJson = $jsonPath
     $script:BgOnDone = $OnDone
     $script:BgStart = Get-Date
+    $script:BgTimeout = [int]$TimeoutSeconds
+    $script:BgDeadline = $null
+    if ($TimeoutSeconds -gt 0) { $script:BgDeadline = $script:BgStart.AddSeconds($TimeoutSeconds) }
+    $script:BgTimedOut = $false
+    $script:BgTimeoutReason = ''
 
     if ($script:TxtBgLog) { $script:TxtBgLog.Text = '' }
     if ($script:TxtBgState) { $script:TxtBgState.Text = $Title }
@@ -1299,6 +1437,32 @@ function Start-BgOperation {
     try { $script:BgTimer.Start() } catch { }
     Write-Log ('Started: ' + $Title)
     return $true
+}
+
+function Stop-BgOperation {
+    param([string]$Reason = 'stopped')
+    if (-not $script:BgJob) { return }
+    $script:BgTimedOut = $true
+    $script:BgTimeoutReason = 'STweak stopped this operation: ' + $Reason
+    Write-Log ('Stopping: ' + $Reason)
+    try { Stop-Job -Job $script:BgJob -ErrorAction SilentlyContinue } catch { }
+    try {
+        foreach ($wp in @(Get-Process -Name winget -ErrorAction SilentlyContinue)) {
+            try {
+                if ((-not $script:BgStart) -or ($wp.StartTime -ge $script:BgStart)) {
+                    Stop-Process -Id $wp.Id -Force -ErrorAction Stop
+                    Write-Log ('Stopped winget process ' + $wp.Id)
+                }
+            } catch { }
+        }
+    } catch { }
+}
+
+function Start-PendingBgOperation {
+    $p = $script:BgPending
+    if (-not $p) { return }
+    $script:BgPending = $null
+    $null = Start-BgOperation -Kind $p.Kind -Title $p.Title -Body $p.Body -Payload $p.Payload -OnDone $p.OnDone -TimeoutSeconds ([int]$p.TimeoutSeconds)
 }
 
 function Read-BgResult {
@@ -1345,6 +1509,10 @@ function Clear-BgOperation {
     }
     $script:BgJob = $null
     $script:BgOnDone = $null
+    $script:BgLog = ''
+    $script:BgJson = ''
+    $script:BgStart = $null
+    $script:BgDeadline = $null
     Set-Busy $false
 }
 
@@ -1373,15 +1541,30 @@ function Update-BgTick {
             if ($script:TxtBgState.Text -ne $line) { $script:TxtBgState.Text = $line }
         } catch { }
     }
-    if ($script:BgJob.State -eq 'Running') { return }
+    $running = $false
+    try { $running = ($script:BgJob.State -eq 'Running') } catch { }
+    if ($running) {
+        if ($script:BgDeadline -and ((Get-Date) -gt $script:BgDeadline)) {
+            $mins = [int][math]::Round($script:BgTimeout / 60.0, 0)
+            Stop-BgOperation -Reason ('no result after ' + $mins + ' minute(s)')
+        } else {
+            return
+        }
+    }
 
     try { $script:BgTimer.Stop() } catch { }
     $result = Read-BgResult
+    if ($script:BgTimedOut) {
+        $result.State = 'TimedOut'
+        $result.Error = $script:BgTimeoutReason
+    }
+    $script:BgTimedOut = $false
     $title = $script:BgTitle
     $done = $script:BgOnDone
     Clear-BgOperation
     if ($result.State -eq 'Completed') { Write-Log ('Finished: ' + $title) }
     else { Write-Log ('Finished with state ' + $result.State + ': ' + $title + '  ' + [string]$result.Error) }
+    Start-PendingBgOperation
     if ($done) {
         try { & $done $result }
         catch { Write-Log ('Completion handler error: ' + $_.Exception.Message) }
@@ -1395,6 +1578,11 @@ $script:BgLog = ''
 $script:BgJson = ''
 $script:BgOnDone = $null
 $script:BgStart = $null
+$script:BgPending = $null
+$script:BgDeadline = $null
+$script:BgTimeout = 0
+$script:BgTimedOut = $false
+$script:BgTimeoutReason = ''
 
 $script:BgTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:BgTimer.Interval = [TimeSpan]::FromMilliseconds(500)
@@ -1411,7 +1599,7 @@ $ProtectedFolderNames = @(
     'internet explorer','common files','packages','wow6432node','microsoft.net','dotnet',
     '$recycle.bin','system volume information','onedrive','appdata','application data',
     'local','roaming','temp','tmp','programs','public','default','default user','all users',
-    'nvidia corporation','amd','intel','edge','edgeupdate','edgewebview'
+    'nvidia corporation','amd','intel','edge','edgeupdate','edgewebview','stweak'
 )
 
 function ConvertTo-NameKey {
@@ -1548,18 +1736,241 @@ function Test-SafeLeftoverPath {
     return $res
 }
 
+function Get-TreeFingerprint {
+    param([string]$Path, [int]$MaxEntries = 500000)
+    $fp = @{ Exists = $false; Count = 0; Bytes = [long]0; Lines = @(); Truncated = $false }
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) { return $fp }
+    $fp.Exists = $true
+    $lines = New-Object System.Collections.Generic.List[string]
+    $base = Get-NormalizedPath $Path
+    if (-not $base) { return $fp }
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (-not $item.PSIsContainer) {
+        $fp.Count = 1
+        $fp.Bytes = [long]$item.Length
+        $fp.Lines = @(('file|{0}|{1}' -f $item.Length, $item.LastWriteTimeUtc.Ticks))
+        return $fp
+    }
+    if (([int]($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) -ne 0) {
+        $fp.Truncated = $true
+        return $fp
+    }
+    $stack = New-Object System.Collections.Generic.Stack[string]
+    $stack.Push($base)
+    while ($stack.Count -gt 0) {
+        $dir = $stack.Pop()
+        $entries = @()
+        try { $entries = @([System.IO.Directory]::GetFileSystemEntries($dir)) } catch { continue }
+        foreach ($ent in $entries) {
+            $it = $null
+            try { $it = Get-Item -LiteralPath $ent -Force -ErrorAction SilentlyContinue } catch { $it = $null }
+            if (-not $it) { continue }
+            if (([int]($it.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) -ne 0) { continue }
+            if ($it.PSIsContainer) { $stack.Push($it.FullName); continue }
+            $fp.Count++
+            $fp.Bytes += [long]$it.Length
+            $rel = [string]$it.FullName
+            if ($rel.StartsWith($base, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $rel = $rel.Substring($base.Length).TrimStart('\')
+            }
+            [void]$lines.Add(('{0}|{1}|{2}' -f $rel.ToLowerInvariant(), $it.Length, $it.LastWriteTimeUtc.Ticks))
+            if ($lines.Count -ge $MaxEntries) { $fp.Truncated = $true; break }
+        }
+        if ($fp.Truncated) { break }
+    }
+    $arr = $lines.ToArray()
+    if ($arr.Count -gt 1) { [Array]::Sort($arr, [System.StringComparer]::Ordinal) }
+    $fp.Lines = $arr
+    return $fp
+}
+
+function Remove-TreeSafely {
+    param([string]$Path)
+    $res = @{ Deleted = 0; Skipped = 0 }
+    try {
+        $it = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    } catch {
+        $res.Skipped = 1
+        return $res
+    }
+    if ($it.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        $res.Skipped = 1
+        return $res
+    }
+    if ($it.PSIsContainer) {
+        foreach ($c in @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue)) {
+            $r = Remove-TreeSafely -Path $c.FullName
+            $res.Deleted += [int]$r.Deleted
+            $res.Skipped += [int]$r.Skipped
+        }
+        try {
+            Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+            $res.Deleted++
+        } catch { $res.Skipped++ }
+    } else {
+        try {
+            Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+            $res.Deleted++
+        } catch { $res.Skipped++ }
+    }
+    return $res
+}
+
+function Get-SafeShortcutRoots {
+    $roots = New-Object System.Collections.Generic.List[string]
+    foreach ($n in @('CommonDesktopDirectory', 'Desktop', 'CommonStartMenu', 'StartMenu')) {
+        try {
+            $pth = [Environment]::GetFolderPath($n)
+            if (-not $pth) { continue }
+            $norm = Get-NormalizedPath $pth
+            if ($norm -and -not $roots.Contains($norm)) { [void]$roots.Add($norm) }
+        } catch { }
+    }
+    return $roots.ToArray()
+}
+
+function Test-SafeShortcutPath {
+    param([string]$Path)
+    $res = @{ Safe = $false; Reason = 'unknown' }
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        $res.Reason = 'file does not exist'
+        return $res
+    }
+    $full = Get-NormalizedPath $Path
+    if (-not $full) { $res.Reason = 'could not normalize path'; return $res }
+    if ([System.IO.Path]::GetExtension($full) -ine '.lnk') {
+        $res.Reason = 'not a .lnk shortcut'
+        return $res
+    }
+    foreach ($r in (Get-SafeShortcutRoots)) {
+        if ($r -and (Test-PathUnder $full $r)) {
+            $res.Safe = $true
+            $res.Reason = ''
+            return $res
+        }
+    }
+    $res.Reason = 'outside the Desktop and Start Menu folders'
+    return $res
+}
+
+function Test-SafeRegistryPath {
+    param([string]$Path)
+    $res = @{ Safe = $false; Reason = 'unknown' }
+    $p = ConvertTo-PSRegPath $Path
+    if (-not $p) { $res.Reason = 'invalid registry path'; return $res }
+    $deny = @('microsoft', 'windows', 'policies', 'classes', 'clients', 'wow6432node', 'registeredapplications', 'scheme', 'shell', 'typedpaths', 'internet explorer', 'odbc')
+    $branches = @('HKCU:\Software\', 'HKLM:\SOFTWARE\WOW6432Node\', 'HKLM:\SOFTWARE\')
+    foreach ($root in $branches) {
+        if (-not $p.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+        $rest = $p.Substring($root.Length).Trim('\')
+        if (-not $rest) { $res.Reason = 'is a registry root itself'; return $res }
+        $segs = @($rest -split '\\')
+        foreach ($seg in $segs) {
+            if ($deny -contains $seg.ToLower()) { $res.Reason = 'protected registry branch: ' + $seg; return $res }
+        }
+        if ($segs.Count -lt 1) { break }
+        $res.Safe = $true
+        $res.Reason = ''
+        return $res
+    }
+    $res.Reason = 'outside the allowed cleanup branches'
+    return $res
+}
+
+function Test-SafeRunValuePath {
+    param([string]$Path)
+    $res = @{ Safe = $false; Reason = 'unknown' }
+    $parts = $Path -split '\|', 2
+    if ($parts.Count -lt 2 -or [string]::IsNullOrWhiteSpace($parts[1])) { $res.Reason = 'invalid run value path'; return $res }
+    $allowed = @(
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce',
+        'HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Run'
+    )
+    $keyPath = ConvertTo-PSRegPath $parts[0]
+    foreach ($a in $allowed) {
+        if ($keyPath -and $keyPath.Equals($a, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $res.Safe = $true
+            $res.Reason = ''
+            return $res
+        }
+    }
+    $res.Reason = 'not a known startup key'
+    return $res
+}
+
+function Test-SafeServiceName {
+    param([string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return @{ Safe = $false; Reason = 'empty service name' } }
+    if ($Name -match '(?i)^(win|ms|wdi|wd|sec|trusted|event|schedule|rpc|dcom|power|themes|audio|dhcp|dns|lanman|spooler|bits|wuauserv|mpssvc|windefend|securityhealth|sense|nissrv|wsearch)') {
+        return @{ Safe = $false; Reason = 'looks like a Windows service' }
+    }
+    $svc = $null
+    try {
+        $safeName = $Name -replace "'", "''"
+        $svc = Get-CimInstance -ClassName Win32_Service -Filter ("Name='" + $safeName + "'") -ErrorAction Stop
+    } catch { $svc = $null }
+    if ($svc) {
+        $bin = ([string]$svc.PathName).Trim()
+        $exe = $bin
+        if ($exe -match '^\s*"([^"]+)"') { $exe = $Matches[1] }
+        elseif ($exe) { $exe = @($exe -split '\s+')[0] }
+        $full = Get-NormalizedPath $exe
+        $inside = $false
+        if ($full) {
+            foreach ($r in (Get-LeftoverAllowedRoots)) {
+                if ($r -and (Test-PathUnder $full $r)) { $inside = $true; break }
+            }
+        }
+        if (-not $inside) { return @{ Safe = $false; Reason = 'the service binary is outside the application folders' } }
+    }
+    return @{ Safe = $true; Reason = '' }
+}
+
 function Get-FolderStats {
     param([string]$Path)
     $size = [long]0
     $count = 0
-    try {
-        foreach ($f in (Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue)) {
-            try { $size += [long]$f.Length; $count++ } catch { }
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) { return @{ SizeMB = 0; FileCount = 0 } }
+    $base = Get-NormalizedPath $Path
+    if (-not $base) { return @{ SizeMB = 0; FileCount = 0 } }
+    $stack = New-Object System.Collections.Generic.Stack[string]
+    $stack.Push($base)
+    while ($stack.Count -gt 0 -and $count -lt 300000) {
+        $dir = $stack.Pop()
+        $entries = @()
+        try { $entries = @([System.IO.Directory]::GetFileSystemEntries($dir)) } catch { continue }
+        foreach ($ent in $entries) {
+            $it = $null
+            try { $it = Get-Item -LiteralPath $ent -Force -ErrorAction SilentlyContinue } catch { $it = $null }
+            if (-not $it) { continue }
+            if (([int]($it.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) -ne 0) { continue }
+            if ($it.PSIsContainer) { $stack.Push($it.FullName); continue }
+            try { $size += [long]$it.Length; $count++ } catch { }
             if ($count -ge 300000) { break }
         }
-    } catch { }
+    }
     $mb = [math]::Round($size / 1048576.0, 1)
     return @{ SizeMB = $mb; FileCount = $count }
+}
+
+function Get-MatchConfidence {
+    param([string]$Key, [string[]]$Matchers)
+    if ([string]::IsNullOrWhiteSpace($Key)) { return 'Low' }
+    foreach ($m in $Matchers) {
+        if (-not $m) { continue }
+        if ($Key -eq $m) { return 'High' }
+    }
+    foreach ($m in $Matchers) {
+        if (-not $m) { continue }
+        if ($Key.StartsWith($m, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $rest = $Key.Substring($m.Length)
+            if ($rest -match '^[0-9]*$') { return 'High' }
+        }
+    }
+    return 'Medium'
 }
 
 function Find-FolderLeftovers {
@@ -1576,6 +1987,7 @@ function Find-FolderLeftovers {
                 if ($m -and $key.Contains($m)) { $hit = $true; break }
             }
             if (-not $hit) { continue }
+            $conf = Get-MatchConfidence -Key $key -Matchers $Matchers
             $safe = Test-SafeLeftoverPath $d.FullName
             $size = '-'
             $files = 0
@@ -1585,12 +1997,13 @@ function Find-FolderLeftovers {
                 $files = [int]$st.FileCount
             }
             [void]$out.Add([PSCustomObject]@{
-                Type   = 'Folder'
-                Path   = $d.FullName
-                Detail = ($root + '  |  ' + $size + ' MB  |  ' + $files + ' files')
-                Safe   = [bool]$safe.Safe
-                Reason = [string]$safe.Reason
-                InUse  = [bool]$safe.InUse
+                Type       = 'Folder'
+                Path       = $d.FullName
+                Detail     = ($root + '  |  ' + $size + ' MB  |  ' + $files + ' files')
+                Safe       = [bool]$safe.Safe
+                Reason     = [string]$safe.Reason
+                InUse      = [bool]$safe.InUse
+                Confidence = $conf
             })
         }
     }
@@ -1617,13 +2030,15 @@ function Find-RegistryLeftovers {
             }
             if (-not $hit) { continue }
             $hk = ([string]$k.PSPath) -replace '^Microsoft\.PowerShell\.Core\\Registry::', ''
+            $safe = Test-SafeRegistryPath $hk
             [void]$out.Add([PSCustomObject]@{
-                Type   = 'RegistryKey'
-                Path   = $hk
-                Detail = $hk
-                Safe   = $true
-                Reason = ''
-                InUse  = $false
+                Type       = 'RegistryKey'
+                Path       = $hk
+                Detail     = $hk
+                Safe       = [bool]$safe.Safe
+                Reason     = [string]$safe.Reason
+                InUse      = $false
+                Confidence = 'Low'
             })
         }
     }
@@ -1646,20 +2061,29 @@ function Find-TaskLeftovers {
         }
         if (-not $hit) { continue }
         [void]$out.Add([PSCustomObject]@{
-            Type   = 'Task'
-            Path   = ($tp + [string]$t.TaskName)
-            Detail = ($tp + [string]$t.TaskName)
-            Safe   = $true
-            Reason = ''
-            InUse  = $false
+            Type       = 'Task'
+            Path       = ($tp + [string]$t.TaskName)
+            Detail     = ($tp + [string]$t.TaskName)
+            Safe       = $true
+            Reason     = ''
+            InUse      = $false
+            Confidence = 'Medium'
         })
     }
     return $out.ToArray()
 }
 
 function Find-ServiceLeftovers {
-    param([string[]]$Matchers)
+    param([string[]]$Matchers, [string[]]$AppFolders = @())
     $out = New-Object System.Collections.Generic.List[object]
+    if (-not $AppFolders -or $AppFolders.Count -eq 0) { return $out.ToArray() }
+    $paths = @{}
+    try {
+        foreach ($w in @(Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue)) {
+            $bin = Get-ExeFromCommandLine ([string]$w.PathName)
+            if ($bin) { $paths[[string]$w.Name] = $bin }
+        }
+    } catch { }
     $svcs = @()
     try { $svcs = @(Get-Service -ErrorAction SilentlyContinue) } catch { }
     foreach ($s in $svcs) {
@@ -1672,13 +2096,27 @@ function Find-ServiceLeftovers {
             if ($m -and $key.Contains($m)) { $hit = $true; break }
         }
         if (-not $hit) { continue }
+        $name = [string]$s.Name
+        $nameCheck = Test-SafeServiceName $name
+        if (-not $nameCheck.Safe) { continue }
+        $bin = $null
+        if ($paths.ContainsKey($name)) { $bin = [string]$paths[$name] }
+        $inside = $false
+        if ($bin) {
+            foreach ($af in $AppFolders) {
+                if ($af -and (Test-PathUnder $bin $af)) { $inside = $true; break }
+            }
+        }
+        if (-not $inside) { continue }
+        $conf = Get-MatchConfidence -Key $key -Matchers $Matchers
         [void]$out.Add([PSCustomObject]@{
-            Type   = 'Service'
-            Path   = [string]$s.Name
-            Detail = ([string]$s.Name + '  (' + [string]$s.DisplayName + ')  [' + $s.StartType.ToString() + ']')
-            Safe   = $true
-            Reason = ''
-            InUse  = $false
+            Type       = 'Service'
+            Path       = $name
+            Detail     = ($name + '  (' + [string]$s.DisplayName + ')  [' + $s.StartType.ToString() + ']  ' + $bin)
+            Safe       = $true
+            Reason     = ''
+            InUse      = $false
+            Confidence = $conf
         })
     }
     return $out.ToArray()
@@ -1717,13 +2155,27 @@ function Find-ShortcutLeftovers {
                 } catch { }
             }
             if (-not $hit) { continue }
+            $conf = Get-MatchConfidence -Key $key -Matchers $Matchers
+            if ($ws -and $AppFolders.Count -gt 0) {
+                try {
+                    $sc2 = $ws.CreateShortcut($f.FullName)
+                    $tp2 = [string]$sc2.TargetPath
+                    if ($tp2) {
+                        foreach ($af in $AppFolders) {
+                            if (Test-PathUnder $tp2 $af) { $conf = 'High'; break }
+                        }
+                    }
+                } catch { }
+            }
+            $safe = Test-SafeShortcutPath $f.FullName
             [void]$out.Add([PSCustomObject]@{
-                Type   = 'Shortcut'
-                Path   = $f.FullName
-                Detail = $f.FullName
-                Safe   = $true
-                Reason = ''
-                InUse  = $false
+                Type       = 'Shortcut'
+                Path       = $f.FullName
+                Detail     = $f.FullName
+                Safe       = [bool]$safe.Safe
+                Reason     = [string]$safe.Reason
+                InUse      = $false
+                Confidence = $conf
             })
         }
     }
@@ -1754,13 +2206,17 @@ function Find-RunValueLeftovers {
                     if ($m -and $norm.Contains($m)) { $hit = $true; break }
                 }
                 if (-not $hit) { continue }
+                $vp = ($rk + '|' + $vn)
+                $safe = Test-SafeRunValuePath $vp
+                $conf = Get-MatchConfidence -Key $norm -Matchers $Matchers
                 [void]$out.Add([PSCustomObject]@{
-                    Type   = 'RunValue'
-                    Path   = ($rk + '|' + $vn)
-                    Detail = ([string]$vn + '  ->  ' + $data)
-                    Safe   = $true
-                    Reason = ''
-                    InUse  = $false
+                    Type       = 'RunValue'
+                    Path       = $vp
+                    Detail     = ([string]$vn + '  ->  ' + $data)
+                    Safe       = [bool]$safe.Safe
+                    Reason     = [string]$safe.Reason
+                    InUse      = $false
+                    Confidence = $conf
                 })
             }
         } catch { }
@@ -1781,23 +2237,147 @@ function Get-ExeFromCommandLine {
     return $null
 }
 
+function Get-UninstallerPolicy {
+    param([string]$Cmd, [string]$EntryKey = '')
+    $res = @{ Allowed = $false; Exe = $null; Reason = 'no command'; Signature = 'Unknown'; Arguments = '' }
+    if ([string]::IsNullOrWhiteSpace($Cmd)) { return $res }
+    $exe = Get-ExeFromCommandLine $Cmd
+    if (-not $exe) {
+        $res.Reason = 'the command does not start with a quoted .exe path'
+        return $res
+    }
+    $exe = $exe.Trim().Trim('"')
+    $res.Exe = $exe
+    try {
+        $res.Arguments = $Cmd.Substring($Cmd.IndexOf($exe, [System.StringComparison]::OrdinalIgnoreCase) + $exe.Length).Trim()
+    } catch { $res.Arguments = '' }
+    $leaf = [System.IO.Path]::GetFileName($exe).ToLowerInvariant()
+    $hosts = @('cmd.exe', 'powershell.exe', 'pwsh.exe', 'wscript.exe', 'cscript.exe', 'mshta.exe', 'rundll32.exe', 'regsvr32.exe')
+    if ($hosts -contains $leaf) {
+        $res.Reason = 'script and rundll hosts are not executed by STweak'
+        return $res
+    }
+    if ($leaf -eq 'msiexec.exe') {
+        $sys = Join-Path $env:WINDIR 'System32\msiexec.exe'
+        if (-not (Test-Path -LiteralPath $sys)) {
+            $res.Reason = 'Windows Installer was not found'
+            return $res
+        }
+        $res.Exe = $sys
+        $res.Signature = 'Windows component'
+        $guid = $null
+        $mm = [regex]::Match([string]$res.Arguments, '\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}')
+        if ($mm.Success) { $guid = $mm.Value.ToUpperInvariant() }
+        $msiPath = $null
+        $pm = [regex]::Match([string]$res.Arguments, '(?i)"([^"]+\.msi)"')
+        if ($pm.Success) { $msiPath = $pm.Groups[1].Value }
+        if ($msiPath) {
+            $msiFull = Get-NormalizedPath $msiPath
+            $msiOk = $false
+            if ($msiFull -and (Test-Path -LiteralPath $msiFull -PathType Leaf)) {
+                try { $msiOk = ((Get-AuthenticodeSignature -LiteralPath $msiFull -ErrorAction Stop).Status -eq 'Valid') } catch { $msiOk = $false }
+            }
+            if (-not $msiOk) {
+                $res.Reason = 'a package file is used by msiexec but it is missing or its signature is not valid'
+                return $res
+            }
+            $res.Allowed = $true
+            $res.Reason = ''
+            return $res
+        }
+        if ($guid) {
+            $machineKey = $false
+            foreach ($root in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall')) {
+                if (Test-Path -LiteralPath ($root + '\' + $guid)) { $machineKey = $true; break }
+            }
+            if (-not $machineKey) {
+                $res.Reason = 'the MSI product is not registered machine-wide, so it is not uninstalled with elevation'
+                return $res
+            }
+            $res.Allowed = $true
+            $res.Reason = ''
+            return $res
+        }
+        $res.Reason = 'the msiexec command has no product code or package file'
+        return $res
+    }
+    if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+        $res.Reason = 'the uninstaller file does not exist'
+        return $res
+    }
+    $full = Get-NormalizedPath $exe
+    if (-not $full) {
+        $res.Reason = 'the uninstaller path could not be normalized'
+        return $res
+    }
+    $inside = $false
+    foreach ($r in (Get-LeftoverAllowedRoots)) {
+        if ($r -and (Test-PathUnder $full $r)) { $inside = $true; break }
+    }
+    if (-not $inside) {
+        $res.Reason = 'the uninstaller is outside the application folders'
+        return $res
+    }
+    $sigStatus = 'Unknown'
+    try {
+        $sig = Get-AuthenticodeSignature -LiteralPath $full -ErrorAction Stop
+        $sigStatus = [string]$sig.Status
+        $res.Signature = $sigStatus
+        if ($sig.SignerCertificate) { $res.Signature += ' / ' + [string]$sig.SignerCertificate.Subject }
+    } catch {
+        $res.Signature = 'Unknown'
+    }
+    $userWritable = $false
+    foreach ($ur in @($env:ProgramData, $env:LOCALAPPDATA, $env:APPDATA, $env:USERPROFILE, $env:TEMP)) {
+        if ($ur -and (Test-PathUnder $full $ur)) { $userWritable = $true; break }
+    }
+    if ($userWritable -and ($sigStatus -ne 'Valid')) {
+        $res.Reason = 'the uninstaller sits in a user-writable folder and its signature is not valid; run it from the app itself instead'
+        return $res
+    }
+    $res.Allowed = $true
+    $res.Reason = ''
+    return $res
+}
+
 function Invoke-UninstallCommand {
-    param([string]$Cmd)
-    if ([string]::IsNullOrWhiteSpace($Cmd)) { return -1 }
+    param([string]$Cmd, [string]$EntryKey = '', [int]$TimeoutMs = 900000)
+    $res = @{ State = 'Rejected'; ExitCode = $null; Message = ''; Signature = 'Unknown'; Exe = '' }
+    $policy = Get-UninstallerPolicy -Cmd $Cmd -EntryKey $EntryKey
+    $res.Signature = [string]$policy.Signature
+    $res.Exe = [string]$policy.Exe
+    if (-not $policy.Allowed) {
+        $res.Message = [string]$policy.Reason
+        return $res
+    }
     try {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = $env:ComSpec
-        $psi.Arguments = '/c ' + $Cmd
+        $psi.FileName = [string]$policy.Exe
+        $psi.Arguments = [string]$policy.Arguments
         $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $false
         $p = [System.Diagnostics.Process]::Start($psi)
-        $ok = $p.WaitForExit(900000)
+        if (-not $p) {
+            $res.State = 'Failed'
+            $res.Message = 'the uninstaller could not be started'
+            return $res
+        }
+        $ok = $p.WaitForExit($TimeoutMs)
         if (-not $ok) {
             try { $p.Kill() } catch { }
-            return -2
+            $res.State = 'TimedOut'
+            $res.Message = ('the uninstaller did not finish within ' + [int][math]::Round($TimeoutMs / 60000.0, 0) + ' minute(s)')
+            return $res
         }
-        return $p.ExitCode
+        $res.ExitCode = $p.ExitCode
+        $res.State = 'Completed'
+        $res.Message = 'exit code ' + $p.ExitCode
+        return $res
     } catch {
-        return -3
+        $res.State = 'Failed'
+        $res.Message = $_.Exception.Message
+        return $res
     }
 }
 
@@ -1839,11 +2419,144 @@ function Get-UninstallEntries {
     return $out.ToArray()
 }
 
-function Test-WinGetAvailable {
+$script:WingetExe = $null
+
+function Get-WingetExePath {
+    if ($script:WingetExe -and (Test-Path -LiteralPath $script:WingetExe)) { return $script:WingetExe }
+    $cands = New-Object System.Collections.Generic.List[string]
     try {
-        $v = (& winget.exe --version 2>$null | Out-String)
-        if ($v -and $v.Trim().Length -gt 0) { return $true }
+        $c = Get-Command -Name 'winget.exe' -ErrorAction SilentlyContinue
+        if ($c -and $c.Source) { [void]$cands.Add([string]$c.Source) }
     } catch { }
+    if ($env:LOCALAPPDATA) {
+        [void]$cands.Add((Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\winget.exe'))
+        $pkg = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe'
+        try {
+            if (Test-Path -LiteralPath $pkg) {
+                foreach ($f in @(Get-ChildItem -LiteralPath $pkg -Filter 'winget.exe' -Recurse -File -ErrorAction SilentlyContinue)) {
+                    [void]$cands.Add([string]$f.FullName)
+                }
+            }
+        } catch { }
+    }
+    if ($env:ProgramFiles) {
+        $pf = Join-Path $env:ProgramFiles 'WindowsApps'
+        try {
+            if (Test-Path -LiteralPath $pf) {
+                foreach ($f in @(Get-ChildItem -LiteralPath $pf -Filter 'winget.exe' -Recurse -File -ErrorAction SilentlyContinue)) {
+                    [void]$cands.Add([string]$f.FullName)
+                }
+            }
+        } catch { }
+    }
+    foreach ($p in $cands) {
+        if ($p -and (Test-Path -LiteralPath $p)) { $script:WingetExe = $p; return $p }
+    }
+    return $null
+}
+
+function Invoke-WingetCli {
+    param([string[]]$Arguments = @(), [int]$TimeoutSeconds = 300, [int]$Attempts = 2)
+    $res = @{ ExitCode = -1; Out = ''; Err = ''; TimedOut = $false; Retried = $false; Message = ''; Exe = '' }
+    $exe = Get-WingetExePath
+    if (-not $exe) {
+        $res.Message = 'winget was not found on this PC'
+        return $res
+    }
+    $res.Exe = $exe
+    $baseArgs = New-Object System.Collections.Generic.List[string]
+    foreach ($a in @($Arguments)) { [void]$baseArgs.Add([string]$a) }
+    $noInteract = -not ($baseArgs -contains '--disable-interactivity')
+
+    $maxAttempts = [math]::Max(1, $Attempts)
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        $argList = New-Object System.Collections.Generic.List[string]
+        foreach ($a in $baseArgs.ToArray()) { [void]$argList.Add([string]$a) }
+        if ($noInteract) { [void]$argList.Add('--disable-interactivity') }
+        $argText = (@($argList.ToArray()) | ForEach-Object {
+            $s = [string]$_
+            if ($s -match '[\s"]') { '"' + ($s -replace '"', '\"') + '"' } else { $s }
+        }) -join ' '
+
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $exe
+        $psi.Arguments = $argText
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardInput = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        try {
+            $psi.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)
+            $psi.StandardErrorEncoding = New-Object System.Text.UTF8Encoding($false)
+        } catch { }
+
+        $p = $null
+        try {
+            $p = [System.Diagnostics.Process]::Start($psi)
+        } catch {
+            $res.Message = 'could not start winget: ' + $_.Exception.Message
+            $res.ExitCode = -1
+            return $res
+        }
+        try { $p.StandardInput.Close() } catch { }
+        $outTask = $null
+        $errTask = $null
+        try { $outTask = $p.StandardOutput.ReadToEndAsync() } catch { }
+        try { $errTask = $p.StandardError.ReadToEndAsync() } catch { }
+        $finished = $p.WaitForExit($TimeoutSeconds * 1000)
+        if (-not $finished) {
+            try { $p.Kill() } catch { }
+            $res.TimedOut = $true
+            $res.ExitCode = -2
+            $res.Message = ('winget did not respond within ' + $TimeoutSeconds + ' second(s)')
+            try {
+                foreach ($wp in @(Get-Process -Name winget -ErrorAction SilentlyContinue)) {
+                    try { if ($wp.Id -ne $PID) { Stop-Process -Id $wp.Id -Force -ErrorAction SilentlyContinue } } catch { }
+                }
+            } catch { }
+            return $res
+        }
+        $out = ''
+        $err = ''
+        try { if ($outTask) { $out = [string]$outTask.Result } } catch { }
+        try { if ($errTask) { $err = [string]$errTask.Result } } catch { }
+        $res.Out = $out
+        $res.Err = $err
+        $res.ExitCode = $p.ExitCode
+        $res.TimedOut = $false
+
+        $combined = $out + ' ' + $err
+        if ($noInteract -and $p.ExitCode -ne 0 -and $combined -match '(?i)(unrecognized|not recognized|unknown (argument|option)|invalid argument)') {
+            $noInteract = $false
+            $maxAttempts = $maxAttempts + 1
+            $res.Retried = $true
+            try { W('this winget version rejected --disable-interactivity; retrying without it') } catch { }
+            continue
+        }
+        $transient = $false
+        if ($p.ExitCode -ne 0) {
+            if ($combined -match '(?i)(no internet|network|timed? ?out|temporar|service unavailable|try again|0x80072|0x8a15005e|429|503)') { $transient = $true }
+        }
+        if ((-not $transient) -or ($attempt -ge $maxAttempts)) { break }
+        $res.Retried = $true
+        $delay = 5 * $attempt
+        if ($combined -match '(?i)retry[- ]after\D{0,10}(\d{1,4})') {
+            $delay = [int]$Matches[1]
+            if ($delay -lt 1) { $delay = 5 }
+            if ($delay -gt 120) { $delay = 120 }
+        }
+        try { W('winget reported a temporary problem; retrying in ' + $delay + 's (attempt ' + ($attempt + 1) + '/' + $maxAttempts + ')') } catch { }
+        Start-Sleep -Seconds $delay
+    }
+    return $res
+}
+
+function Test-WinGetAvailable {
+    if (-not (Get-WingetExePath)) { return $false }
+    $r = Invoke-WingetCli -Arguments @('--version') -TimeoutSeconds 30 -Attempts 1
+    if ($r.TimedOut) { return $false }
+    if ($r.ExitCode -eq 0 -and $r.Out -and $r.Out.Trim().Length -gt 0) { return $true }
     return $false
 }
 
@@ -1974,6 +2687,7 @@ try {
     $installLoc = [string]$Payload['InstallLocation']
     $uninstallCmd = [string]$Payload['UninstallCommand']
     $runUninstaller = [bool]$Payload['RunUninstaller']
+    $entryKey = [string]$Payload['EntryKey']
 
     W('Deep scan started for: ' + $app)
     if ($pub) { W('Publisher: ' + $pub) }
@@ -1984,8 +2698,14 @@ try {
     if ($runUninstaller -and $uninstallCmd) {
         W('Running the official uninstaller...')
         W('Command: ' + $uninstallCmd)
-        $code = Invoke-UninstallCommand -Cmd $uninstallCmd
-        W('Uninstaller exit code: ' + $code)
+        $u = Invoke-UninstallCommand -Cmd $uninstallCmd -EntryKey $entryKey
+        W('Uninstaller state: ' + [string]$u.State)
+        W('Uninstaller exit code: ' + [string]$u.ExitCode)
+        if ($u.Message) { W('Uninstaller detail: ' + [string]$u.Message) }
+        if ($u.Signature) { W('Uninstaller signature: ' + [string]$u.Signature) }
+        if ($u.State -eq 'Rejected' -or $u.State -eq 'Failed') {
+            W('The official uninstaller was not run to completion - the scan continues with read-only leftovers.')
+        }
         Start-Sleep -Seconds 3
     } elseif ($runUninstaller) {
         W('No uninstall command available - skipping the official uninstaller.')
@@ -1996,6 +2716,13 @@ try {
     W('Scanning folders...')
     foreach ($it in (Find-FolderLeftovers -Matchers $matchers)) { $items.Add($it) }
     W('Folders found: ' + $items.Count)
+
+    $folders = @()
+    foreach ($it in $items) { if ($it.Type -eq 'Folder') { $folders += $it.Path } }
+    if ($installLoc -and (Test-Path -LiteralPath $installLoc)) {
+        $n = Get-NormalizedPath $installLoc
+        if ($n -and -not ($folders -contains $n)) { $folders += $n }
+    }
 
     W('Scanning registry keys...')
     $rc = $items.Count
@@ -2009,14 +2736,11 @@ try {
 
     W('Scanning services...')
     $rc = $items.Count
-    foreach ($it in (Find-ServiceLeftovers -Matchers $matchers)) { $items.Add($it) }
+    foreach ($it in (Find-ServiceLeftovers -Matchers $matchers -AppFolders $folders)) { $items.Add($it) }
     W('Services found: ' + ($items.Count - $rc))
 
     W('Scanning shortcuts...')
     $rc = $items.Count
-    $folders = @()
-    foreach ($it in $items) { if ($it.Type -eq 'Folder') { $folders += $it.Path } }
-    if ($installLoc -and (Test-Path -LiteralPath $installLoc)) { $folders += $installLoc }
     foreach ($it in (Find-ShortcutLeftovers -Matchers $matchers -AppFolders $folders)) { $items.Add($it) }
     W('Shortcuts found: ' + ($items.Count - $rc))
 
@@ -2033,12 +2757,13 @@ try {
         foreach ($m in $matchers) { if ($m -and $key.Contains($m)) { $hit = $true; break } }
         if ($hit) {
             $items.Add([PSCustomObject]@{
-                Type   = 'UninstallEntry'
-                Path   = $ue.KeyPath
-                Detail = ($ue.DisplayName + '  ' + $ue.Version)
-                Safe   = $true
-                Reason = ''
-                InUse  = $false
+                Type       = 'UninstallEntry'
+                Path       = $ue.KeyPath
+                Detail     = ($ue.DisplayName + '  ' + $ue.Version)
+                Safe       = $true
+                Reason     = ''
+                InUse      = $false
+                Confidence = (Get-MatchConfidence -Key $key -Matchers $matchers)
             })
         }
     }
@@ -2062,66 +2787,291 @@ try {
 '@
 
 function Get-QuarantineManifest {
-    if (Test-Path -LiteralPath $ManifestFile) {
-        try {
-            $raw = Get-Content -LiteralPath $ManifestFile -Raw -ErrorAction Stop
-            if (-not [string]::IsNullOrWhiteSpace($raw)) {
-                $obj = $raw | ConvertFrom-Json -ErrorAction Stop
-                $names = @($obj.PSObject.Properties.Name)
-                $nextId = 1
-                if ($names -contains 'nextId') { $nextId = [int]$obj.nextId }
-                if ($nextId -lt 1) { $nextId = 1 }
-                $entries = @()
-                if ($names -contains 'entries') { $entries = @($obj.entries | Where-Object { $_ }) }
-                return @{ nextId = $nextId; entries = $entries }
+    $empty = @{ nextId = 1; entries = @() }
+    if (-not (Test-Path -LiteralPath $ManifestFile)) { return $empty }
+    try {
+        $raw = Get-Content -LiteralPath $ManifestFile -Raw -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($raw)) { throw 'the file is empty' }
+        $obj = $raw | ConvertFrom-Json -ErrorAction Stop
+        if ($null -eq $obj) { throw 'the file has no JSON object' }
+        $names = @($obj.PSObject.Properties.Name)
+        $nextId = 1
+        if ($names -contains 'nextId') { $nextId = [int]$obj.nextId }
+        if ($nextId -lt 1) { $nextId = 1 }
+        $entries = @()
+        if ($names -contains 'entries') {
+            foreach ($e in @($obj.entries)) {
+                if (-not $e) { continue }
+                if (@($e.PSObject.Properties.Name) -notcontains 'Id') { continue }
+                $entries += $e
             }
-        } catch {
-            Write-FileLog ('WARNING: quarantine manifest was damaged (' + $_.Exception.Message + '); starting a new one.')
+        }
+        return @{ nextId = $nextId; entries = $entries }
+    } catch {
+        $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        $bad = Join-Path $QuarantineDir ('manifest.corrupt-' + $stamp + '.json')
+        $kept = $false
+        try {
+            Move-Item -LiteralPath $ManifestFile -Destination $bad -Force -ErrorAction Stop
+            $kept = $true
+        } catch { }
+        if ($kept) {
+            Write-FileLog ('WARNING: quarantine manifest was unreadable (' + $_.Exception.Message + '); preserved as ' + $bad + ' and started a new one.')
+        } else {
+            Write-FileLog ('WARNING: quarantine manifest was unreadable (' + $_.Exception.Message + '); it could not be preserved and a new one will replace it.')
         }
     }
-    return @{ nextId = 1; entries = @() }
+    return $empty
 }
 
 function Save-QuarantineManifest {
     param($Manifest)
+    if (-not (Test-Path -LiteralPath $QuarantineDir)) { New-Item -ItemType Directory -Path $QuarantineDir -Force | Out-Null }
     $json = $Manifest | ConvertTo-Json -Depth 8
     $tmp = $ManifestFile + '.tmp'
-    Set-Content -LiteralPath $tmp -Value $json -Encoding UTF8 -ErrorAction Stop
-    Move-Item -LiteralPath $tmp -Destination $ManifestFile -Force
+    $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($json)
+    $fs = [System.IO.File]::Open($tmp, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    try {
+        $fs.Write($bytes, 0, $bytes.Length)
+        $fs.Flush($true)
+    } finally {
+        $fs.Dispose()
+    }
+    try {
+        if (Test-Path -LiteralPath $ManifestFile) {
+            try { [System.IO.File]::Replace($tmp, $ManifestFile, $null) }
+            catch { Move-Item -LiteralPath $tmp -Destination $ManifestFile -Force -ErrorAction Stop }
+        } else {
+            Move-Item -LiteralPath $tmp -Destination $ManifestFile -Force -ErrorAction Stop
+        }
+    } catch {
+        try { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } } catch { }
+        throw
+    }
+}
+
+function Get-QuarantinePayloadRoots {
+    $roots = New-Object System.Collections.Generic.List[string]
+    foreach ($r in @($QuarantineDir, $RegBackupDir, $TaskBackupDir)) {
+        $n = Get-NormalizedPath $r
+        if ($n -and -not $roots.Contains($n)) { [void]$roots.Add($n) }
+    }
+    return $roots.ToArray()
+}
+
+function Test-QuarantinePayloadPath {
+    param([string]$Path, [switch]$AllowMissing)
+    $res = @{ Safe = $false; Reason = 'unknown' }
+    if ([string]::IsNullOrWhiteSpace($Path)) { $res.Reason = 'empty path'; return $res }
+    $full = Get-NormalizedPath $Path
+    if (-not $full) { $res.Reason = 'could not normalize the path'; return $res }
+    $inside = $false
+    foreach ($r in (Get-QuarantinePayloadRoots)) {
+        if ($full.Equals($r, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $res.Reason = 'is the quarantine folder itself, not a saved item'; return $res
+        }
+        if (Test-PathUnder $full $r) { $inside = $true; break }
+    }
+    if (-not $inside) { $res.Reason = 'outside the quarantine and backup folders'; return $res }
+    if (-not $AllowMissing -and -not (Test-Path -LiteralPath $full)) { $res.Reason = 'the saved copy is missing'; return $res }
+    $cur = $full
+    while ($cur) {
+        $it = Get-Item -LiteralPath $cur -Force -ErrorAction SilentlyContinue
+        if ($it -and (([int]($it.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) -ne 0)) {
+            $res.Reason = 'junction/symlink (reparse point)'; return $res
+        }
+        $parent = Split-Path -Path $cur -Parent
+        if (-not $parent -or $parent -eq $cur) { break }
+        $cur = $parent
+    }
+    $res.Safe = $true
+    $res.Reason = ''
+    return $res
+}
+
+function Test-SafeRestoreTarget {
+    param([string]$Type, [string]$Path)
+    $res = @{ Safe = $false; Reason = 'unknown' }
+    if ([string]::IsNullOrWhiteSpace($Path)) { $res.Reason = 'empty restore path'; return $res }
+    if ($Type -eq 'Task') {
+        $t = $Path.Trim()
+        if ($t -notmatch '^\\[^\\]') { $res.Reason = 'invalid task path'; return $res }
+        if ($t -match '[\"\r\n]' -or $t -match '\\\.\.?(\\|$)') { $res.Reason = 'invalid task path'; return $res }
+        if ($t -like '\Microsoft\*') { $res.Reason = 'Windows system task'; return $res }
+        $res.Safe = $true; $res.Reason = ''
+        return $res
+    }
+    $full = Get-NormalizedPath $Path
+    if (-not $full) { $res.Reason = 'could not normalize the restore path'; return $res }
+    if ($full -match '^[A-Za-z]:$') { $res.Reason = 'is a drive root'; return $res }
+    $deny = New-Object System.Collections.Generic.List[string]
+    if ($env:SystemRoot) { [void]$deny.Add($env:SystemRoot) }
+    if ($env:SystemDrive) { [void]$deny.Add((Join-Path $env:SystemDrive 'Boot')) }
+    if ($env:ProgramFiles) { [void]$deny.Add((Join-Path $env:ProgramFiles 'WindowsApps')) }
+    if (${env:ProgramFiles(x86)}) { [void]$deny.Add((Join-Path ${env:ProgramFiles(x86)} 'WindowsApps')) }
+    if ($env:ProgramData) { [void]$deny.Add((Join-Path $env:ProgramData 'Microsoft')) }
+    [void]$deny.Add($RootDir)
+    $startupTarget = $false
+    if ($Type -eq 'Shortcut') {
+        $startupRoots = New-Object System.Collections.Generic.List[string]
+        if ($env:ProgramData) { [void]$startupRoots.Add((Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Startup')) }
+        if ($env:APPDATA) { [void]$startupRoots.Add((Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup')) }
+        foreach ($sr in $startupRoots) {
+            if ($full.StartsWith($sr + '\', [System.StringComparison]::OrdinalIgnoreCase)) { $startupTarget = $true; break }
+        }
+    }
+    $pdMicrosoft = $null
+    if ($env:ProgramData) { $pdMicrosoft = Join-Path $env:ProgramData 'Microsoft' }
+    foreach ($d in $deny) {
+        # Startup shortcuts are a normal restore target even though they live under ProgramData\Microsoft.
+        if ($startupTarget -and $pdMicrosoft -and $d.Equals($pdMicrosoft, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+        if (Test-PathUnder $full $d) { $res.Reason = 'protected restore location: ' + $d; return $res }
+    }
+    $cur = $full
+    while ($cur) {
+        $it = Get-Item -LiteralPath $cur -Force -ErrorAction SilentlyContinue
+        if ($it -and (([int]($it.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) -ne 0)) {
+            $res.Reason = 'the restore path crosses a junction/symlink'; return $res
+        }
+        $parent = Split-Path -Path $cur -Parent
+        if (-not $parent -or $parent -eq $cur) { break }
+        $cur = $parent
+    }
+    $res.Safe = $true
+    $res.Reason = ''
+    return $res
+}
+
+function Test-SafeRegistryRestoreTarget {
+    param([string]$Type, [string]$Path)
+    $res = @{ Safe = $false; Reason = 'unknown' }
+    if ([string]::IsNullOrWhiteSpace($Path)) { $res.Reason = 'empty registry path'; return $res }
+    if ($Type -eq 'RunValue') {
+        $rv = Test-SafeRunValuePath $Path
+        if (-not [bool]$rv.Safe) { $res.Reason = [string]$rv.Reason; return $res }
+        $res.Safe = $true; $res.Reason = ''
+        return $res
+    }
+    $p = ConvertTo-PSRegPath $Path
+    if (-not $p) { $res.Reason = 'invalid registry path'; return $res }
+    $p = $p.TrimEnd('\')
+    $deny = @(
+        'HKLM:\SYSTEM', 'HKLM:\SECURITY', 'HKLM:\SAM', 'HKLM:\SOFTWARE\Classes',
+        'HKLM:\SOFTWARE\Policies', 'HKLM:\SOFTWARE\Microsoft\Windows NT',
+        'HKCU:\Software\Policies', 'HKCU:\Software\Classes', 'HKCU:\Software\Microsoft\Windows NT'
+    )
+    foreach ($d in $deny) {
+        if ($p.Equals($d, [System.StringComparison]::OrdinalIgnoreCase) -or (Test-PathUnder $p $d)) {
+            $res.Reason = 'protected registry branch: ' + $d; return $res
+        }
+    }
+    $allowed = $false
+    foreach ($r in @('HKCU:\Software', 'HKLM:\SOFTWARE\WOW6432Node', 'HKLM:\SOFTWARE')) {
+        if ($p.Equals($r, [System.StringComparison]::OrdinalIgnoreCase) -or (Test-PathUnder $p $r)) { $allowed = $true; break }
+    }
+    if (-not $allowed) { $res.Reason = 'outside the restorable registry branches'; return $res }
+    $rest = ($p -replace '^[^:]+:\\?', '')
+    if ([string]::IsNullOrWhiteSpace($rest)) { $res.Reason = 'is a registry root itself'; return $res }
+    foreach ($seg in ($rest -split '\\')) {
+        if (-not $seg -or $seg -eq '.' -or $seg -eq '..') { $res.Reason = 'invalid registry path segment'; return $res }
+    }
+    $res.Safe = $true
+    $res.Reason = ''
+    return $res
+}
+
+function Test-RegFileMatchesKey {
+    param([string]$RegFile, [string]$KeyPath)
+    $res = @{ Safe = $false; Reason = 'unknown' }
+    if (-not $RegFile -or -not (Test-Path -LiteralPath $RegFile)) { $res.Reason = 'the backup file is missing'; return $res }
+    $target = ConvertTo-RegExePath $KeyPath
+    if (-not $target) { $res.Reason = 'invalid registry key'; return $res }
+    $target = $target.TrimEnd('\')
+    $lines = @()
+    try { $lines = @(Get-Content -LiteralPath $RegFile -ErrorAction Stop) } catch { $res.Reason = 'could not read the backup file'; return $res }
+    $n = 0
+    foreach ($ln in $lines) {
+        $t = ([string]$ln).Trim()
+        if ($t -notmatch '^\[(-?HKEY_[^\]]+)\]$') { continue }
+        $n++
+        $k = $Matches[1].TrimEnd('\')
+        if (-not $k.Equals($target, [System.StringComparison]::OrdinalIgnoreCase) -and -not (Test-PathUnder $k $target)) {
+            $res.Reason = ('the backup writes outside the quarantined key: ' + $k); return $res
+        }
+    }
+    if ($n -eq 0) { $res.Reason = 'the backup has no registry key header'; return $res }
+    $res.Safe = $true
+    $res.Reason = ''
+    return $res
+}
+
+function Get-QuarantineEntryById {
+    param([int]$Id)
+    $m = Get-QuarantineManifest
+    foreach ($x in @($m.entries)) {
+        $h = ConvertTo-HashtableDeep $x
+        if ([int]$h['Id'] -eq $Id) { return $h }
+    }
+    return $null
+}
+
+function Invoke-WithManifestLock {
+    param([scriptblock]$Body)
+    $mtx = $null
+    $taken = $false
+    try {
+        try { $mtx = New-Object System.Threading.Mutex($false, 'Local\STweakQuarantineManifest') } catch { $mtx = $null }
+        if ($mtx) {
+            try { $taken = $mtx.WaitOne(5000) }
+            catch [System.Threading.AbandonedMutexException] { $taken = $true }
+            if (-not $taken) { throw 'the quarantine manifest is busy; try again in a moment' }
+        }
+        & $Body
+    } finally {
+        if ($mtx) {
+            if ($taken) { try { $mtx.ReleaseMutex() } catch { } }
+            try { $mtx.Dispose() } catch { }
+        }
+    }
 }
 
 function Add-QuarantineEntry {
-    param([string]$App, [string]$Type, [string]$OriginalPath, [string]$QuarantinePath)
-    $m = Get-QuarantineManifest
-    $id = [int]$m.nextId
-    $entry = [PSCustomObject]@{
-        Id             = $id
-        App            = $App
-        Type           = $Type
-        OriginalPath   = $OriginalPath
-        QuarantinePath = $QuarantinePath
-        Created        = (Get-Date).ToString('s')
-        Restored       = $false
+    param([string]$App, [string]$Type, [string]$OriginalPath, [string]$QuarantinePath, $Data = $null)
+    return Invoke-WithManifestLock {
+        $m = Get-QuarantineManifest
+        $id = [int]$m.nextId
+        $entry = [PSCustomObject]@{
+            Id             = $id
+            App            = $App
+            Type           = $Type
+            OriginalPath   = $OriginalPath
+            QuarantinePath = $QuarantinePath
+            Created        = (Get-Date).ToString('s')
+            Restored       = $false
+        }
+        if ($null -ne $Data) { $entry | Add-Member -NotePropertyName 'Data' -NotePropertyValue $Data -Force }
+        $m.entries = @($m.entries) + @($entry)
+        $m.nextId = $id + 1
+        Save-QuarantineManifest $m
+        Write-FileLog ('Quarantined [' + $Type + '] ' + $OriginalPath + '  ->  ' + $QuarantinePath)
+        return $entry
     }
-    $m.entries = @($m.entries) + @($entry)
-    $m.nextId = $id + 1
-    Save-QuarantineManifest $m
-    Write-FileLog ('Quarantined [' + $Type + '] ' + $OriginalPath + '  ->  ' + $QuarantinePath)
-    return $entry
 }
 
 function Set-QuarantineEntryFlag {
     param([int]$Id, [string]$Field, $Value)
-    $m = Get-QuarantineManifest
-    $changed = $false
-    foreach ($e in $m.entries) {
-        if ([int]$e.Id -eq $Id) {
-            if (@($e.PSObject.Properties.Name) -contains $Field) { $e.$Field = $Value }
-            else { $e | Add-Member -NotePropertyName $Field -NotePropertyValue $Value -Force }
-            $changed = $true
+    Invoke-WithManifestLock {
+        $m = Get-QuarantineManifest
+        $changed = $false
+        foreach ($e in $m.entries) {
+            if ([int]$e.Id -eq $Id) {
+                if (@($e.PSObject.Properties.Name) -contains $Field) { $e.$Field = $Value }
+                else { $e | Add-Member -NotePropertyName $Field -NotePropertyValue $Value -Force }
+                $changed = $true
+            }
         }
-    }
-    if ($changed) { Save-QuarantineManifest $m }
+        if ($changed) { Save-QuarantineManifest $m }
+    } | Out-Null
 }
 
 function Get-QuarantineEntriesView {
@@ -2152,21 +3102,48 @@ function Get-QuarantineEntriesView {
 
 function Move-ItemWithFallback {
     param([string]$From, [string]$To)
+    if (-not (Test-Path -LiteralPath $From)) { return $false }
     try {
         Move-Item -LiteralPath $From -Destination $To -Force -ErrorAction Stop
         return $true
     } catch { }
+    $destPath = $To
+    try {
+        if (Test-Path -LiteralPath $To -PathType Container) {
+            $destPath = Join-Path $To (Split-Path -Path $From -Leaf)
+        }
+    } catch { }
+    $before = Get-TreeFingerprint $From
     try {
         $it = Get-Item -LiteralPath $From -Force -ErrorAction Stop
         if ($it.PSIsContainer) {
             Copy-Item -LiteralPath $From -Destination $To -Recurse -Force -ErrorAction Stop
-            Remove-Item -LiteralPath $From -Recurse -Force -ErrorAction Stop
         } else {
             Copy-Item -LiteralPath $From -Destination $To -Force -ErrorAction Stop
-            Remove-Item -LiteralPath $From -Force -ErrorAction Stop
         }
+        $after = Get-TreeFingerprint $destPath
+        if (-not $after.Exists) { throw 'the copy did not appear at the destination' }
+        if ($after.Count -ne $before.Count -or $after.Bytes -ne $before.Bytes) {
+            throw ('the copy is incomplete (' + $after.Count + '/' + $before.Count + ' files, ' + $after.Bytes + '/' + $before.Bytes + ' bytes)')
+        }
+        if ((-not $before.Truncated) -and (-not $after.Truncated)) {
+            $la = @($before.Lines)
+            $lb = @($after.Lines)
+            if ($la.Count -ne $lb.Count) { throw 'the copy has a different file list' }
+            for ($i = 0; $i -lt $la.Count; $i++) {
+                if ([string]$la[$i] -ne [string]$lb[$i]) { throw ('the copy differs at: ' + [string]$la[$i]) }
+            }
+        }
+        Remove-Item -LiteralPath $From -Recurse -Force -ErrorAction Stop
         return $true
-    } catch { return $false }
+    } catch {
+        try {
+            if (Test-Path -LiteralPath $destPath) {
+                Remove-Item -LiteralPath $destPath -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        } catch { }
+        return $false
+    }
 }
 
 function Move-PathToQuarantine {
@@ -2198,6 +3175,40 @@ function Remove-LeftoverItem {
     $type = [string]$h['Type']
     $path = [string]$h['Path']
     try {
+        $checkable = @('Folder', 'Shortcut', 'RegistryKey', 'UninstallEntry', 'RunValue')
+        $present = $true
+        if ($type -eq 'Folder' -or $type -eq 'Shortcut') {
+            $present = Test-Path -LiteralPath $path
+        } elseif ($type -eq 'RegistryKey' -or $type -eq 'UninstallEntry') {
+            $rp = ConvertTo-PSRegPath $path
+            $present = ($rp -and (Test-Path -LiteralPath $rp))
+        } elseif ($type -eq 'RunValue') {
+            $parts = $path -split '\|', 2
+            $rp = $null
+            if ($parts.Count -ge 1) { $rp = ConvertTo-PSRegPath $parts[0] }
+            $present = ($rp -and (Test-Path -LiteralPath $rp))
+        }
+        if (($checkable -contains $type) -and (-not $present)) {
+            return @{ Success = $true; Message = 'already gone' }
+        }
+
+        $guard = @{ Safe = $false; Reason = 'unsupported item type' }
+        switch ($type) {
+            'Folder'         { $guard = Test-SafeLeftoverPath $path }
+            'Shortcut'       { $guard = Test-SafeShortcutPath $path }
+            'RegistryKey'    { $guard = Test-SafeRegistryPath $path }
+            'UninstallEntry' { $guard = Test-SafeRegistryPath $path }
+            'RunValue'       { $guard = Test-SafeRunValuePath $path }
+            'Task' {
+                if ($path -like '\Microsoft\*') { $guard = @{ Safe = $false; Reason = 'Windows system task' } }
+                else { $guard = @{ Safe = $true; Reason = '' } }
+            }
+            'Service' { $guard = Test-SafeServiceName $path }
+        }
+        if (-not [bool]$guard.Safe) {
+            throw ('blocked by the safety check: ' + [string]$guard.Reason)
+        }
+
         switch ($type) {
             'Folder' {
                 if (-not (Test-Path -LiteralPath $path)) { return @{ Success = $true; Message = 'already gone' } }
@@ -2208,12 +3219,20 @@ function Remove-LeftoverItem {
                         [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($path, [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs, [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)
                     }
                 } elseif ($Mode -eq 'Delete') {
-                    Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
+                    $dt = Remove-TreeSafely -Path $path
+                    if ([int]$dt.Skipped -gt 0) { throw ('some files could not be deleted (' + [string]$dt.Skipped + ' skipped, in use or links)') }
                     Write-FileLog ('Deleted folder: ' + $path)
                 } else {
                     $qp = Move-PathToQuarantine -Path $path -App $App
                     if (-not $qp) { throw 'could not move the folder to quarantine' }
-                    Add-QuarantineEntry -App $App -Type 'Folder' -OriginalPath $path -QuarantinePath $qp | Out-Null
+                    try {
+                        Add-QuarantineEntry -App $App -Type 'Folder' -OriginalPath $path -QuarantinePath $qp | Out-Null
+                    } catch {
+                        $back = $false
+                        try { $back = Move-ItemWithFallback -From $qp -To $path } catch { $back = $false }
+                        if ($back) { throw ('could not record the quarantine entry, so the folder was put back: ' + $_.Exception.Message) }
+                        throw ('could not record the quarantine entry and the folder stayed in ' + $qp + ': ' + $_.Exception.Message)
+                    }
                 }
             }
             'Shortcut' {
@@ -2230,7 +3249,14 @@ function Remove-LeftoverItem {
                 } else {
                     $qp = Move-PathToQuarantine -Path $path -App $App
                     if (-not $qp) { throw 'could not move the shortcut to quarantine' }
-                    Add-QuarantineEntry -App $App -Type 'Shortcut' -OriginalPath $path -QuarantinePath $qp | Out-Null
+                    try {
+                        Add-QuarantineEntry -App $App -Type 'Shortcut' -OriginalPath $path -QuarantinePath $qp | Out-Null
+                    } catch {
+                        $back = $false
+                        try { $back = Move-ItemWithFallback -From $qp -To $path } catch { $back = $false }
+                        if ($back) { throw ('could not record the quarantine entry, so the shortcut was put back: ' + $_.Exception.Message) }
+                        throw ('could not record the quarantine entry and the shortcut stayed in ' + $qp + ': ' + $_.Exception.Message)
+                    }
                 }
             }
             'RegistryKey' {
@@ -2271,9 +3297,24 @@ function Remove-LeftoverItem {
                     Remove-ItemProperty -LiteralPath $keyPath -Name $valName -ErrorAction Stop
                     Write-FileLog ('Deleted run value: ' + $path)
                 } else {
+                    $data = $null
+                    try {
+                        $rk = Get-Item -LiteralPath $keyPath -ErrorAction Stop
+                        $kind = [string]$rk.GetValueKind($valName)
+                        $val = $rk.GetValue($valName, $null)
+                        $okKinds = @('String', 'ExpandString', 'DWord', 'QWord', 'MultiString', 'Binary')
+                        if (($okKinds -contains $kind) -and ($null -ne $val)) {
+                            if ($kind -eq 'Binary') { $val = [byte[]]$val }
+                            elseif ($kind -eq 'MultiString') { $val = @($val) }
+                            elseif ($kind -eq 'DWord') { $val = [int]$val }
+                            elseif ($kind -eq 'QWord') { $val = [long]$val }
+                            else { $val = [string]$val }
+                            $data = @{ Kind = $kind; Value = $val }
+                        }
+                    } catch { $data = $null }
                     $bk = Export-RegKeyBackup $keyPath
-                    if (-not $bk) { throw 'could not export the registry key' }
-                    Add-QuarantineEntry -App $App -Type 'RunValue' -OriginalPath $path -QuarantinePath $bk | Out-Null
+                    if (-not $bk -and -not $data) { throw 'could not back up the startup value' }
+                    Add-QuarantineEntry -App $App -Type 'RunValue' -OriginalPath $path -QuarantinePath $bk -Data $data | Out-Null
                     Remove-ItemProperty -LiteralPath $keyPath -Name $valName -ErrorAction Stop
                 }
             }
@@ -2282,6 +3323,8 @@ function Remove-LeftoverItem {
                 if ($i -lt 0) { throw 'invalid task path' }
                 $tPath = $path.Substring(0, $i + 1)
                 $tName = $path.Substring($i + 1)
+                $tchk = Test-SafeRestoreTarget -Type 'Task' -Path $path
+                if (-not $tchk.Safe) { throw ('refusing to remove this task: ' + [string]$tchk.Reason) }
                 if ($Mode -eq 'Quarantine') {
                     $tf = Backup-ScheduledTaskXml -TaskFullName $path
                     if (-not $tf) { throw 'could not export the scheduled task backup' }
@@ -2294,6 +3337,8 @@ function Remove-LeftoverItem {
                 $svcName = $path
                 $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
                 if (-not $svc) { return @{ Success = $true; Message = 'already gone' } }
+                $svcChk = Test-SafeServiceName $svcName
+                if (-not $svcChk.Safe) { throw ('refusing to remove this service: ' + [string]$svcChk.Reason) }
                 if ($Mode -eq 'Quarantine') {
                     $safe = ($svcName -replace '[^\w\.\-]', '_')
                     $file = Join-Path $TaskBackupDir ($safe + '_service_' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.txt')
@@ -2321,43 +3366,98 @@ function Remove-LeftoverItem {
 
 function Restore-QuarantineEntry {
     param($Entry)
-    $e = ConvertTo-HashtableDeep $Entry
+    $snap = ConvertTo-HashtableDeep $Entry
+    $id = 0
+    try { $id = [int]$snap['Id'] } catch { $id = 0 }
+    if ($id -le 0) { return @{ Success = $false; Message = 'invalid quarantine entry' } }
+    $e = Get-QuarantineEntryById -Id $id
+    if (-not $e) { return @{ Success = $false; Message = 'the quarantine entry is no longer in the manifest' } }
     $type = [string]$e['Type']
     $orig = [string]$e['OriginalPath']
     $qp = [string]$e['QuarantinePath']
     try {
         switch ($type) {
             'Folder' {
-                if (-not $qp -or -not (Test-Path -LiteralPath $qp)) { return @{ Success = $false; Message = 'quarantined folder is missing' } }
+                $chk = Test-QuarantinePayloadPath $qp
+                if (-not $chk.Safe) { return @{ Success = $false; Message = ('the saved folder cannot be used: ' + [string]$chk.Reason) } }
+                $self = Test-QuarantinePayloadPath $orig -AllowMissing
+                if ($self.Safe) { return @{ Success = $false; Message = 'the original path points inside the quarantine folder' } }
+                $tchk = Test-SafeRestoreTarget -Type 'Folder' -Path $orig
+                if (-not $tchk.Safe) { return @{ Success = $false; Message = ('refusing to restore to ' + $orig + ': ' + [string]$tchk.Reason) } }
                 if (Test-Path -LiteralPath $orig) { return @{ Success = $false; Message = 'the original path already exists' } }
                 $parent = Split-Path -Path $orig -Parent
                 if ($parent -and -not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
                 if (-not (Move-ItemWithFallback -From $qp -To $orig)) { throw 'could not move the folder back' }
             }
             'Shortcut' {
-                if (-not $qp -or -not (Test-Path -LiteralPath $qp)) { return @{ Success = $false; Message = 'quarantined shortcut is missing' } }
+                $chk = Test-QuarantinePayloadPath $qp
+                if (-not $chk.Safe) { return @{ Success = $false; Message = ('the saved shortcut cannot be used: ' + [string]$chk.Reason) } }
+                $tchk = Test-SafeRestoreTarget -Type 'Shortcut' -Path $orig
+                if (-not $tchk.Safe) { return @{ Success = $false; Message = ('refusing to restore to ' + $orig + ': ' + [string]$tchk.Reason) } }
                 if (Test-Path -LiteralPath $orig) { return @{ Success = $false; Message = 'the original path already exists' } }
                 $parent = Split-Path -Path $orig -Parent
                 if ($parent -and -not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
                 if (-not (Move-ItemWithFallback -From $qp -To $orig)) { throw 'could not move the shortcut back' }
             }
             'RegistryKey' {
-                if (-not $qp -or -not (Test-Path -LiteralPath $qp)) { return @{ Success = $false; Message = 'quarantined .reg file is missing' } }
+                $chk = Test-QuarantinePayloadPath $qp
+                if (-not $chk.Safe) { return @{ Success = $false; Message = ('the saved registry backup cannot be used: ' + [string]$chk.Reason) } }
+                $tchk = Test-SafeRegistryRestoreTarget -Type 'RegistryKey' -Path $orig
+                if (-not $tchk.Safe) { return @{ Success = $false; Message = ('refusing to restore this registry key: ' + [string]$tchk.Reason) } }
+                $rc = Test-RegFileMatchesKey -RegFile $qp -KeyPath $orig
+                if (-not $rc.Safe) { return @{ Success = $false; Message = ('the registry backup was refused: ' + [string]$rc.Reason) } }
                 & reg.exe import $qp | Out-Null
                 if ($LASTEXITCODE -ne 0) { throw 'reg import failed' }
             }
             'UninstallEntry' {
-                if (-not $qp -or -not (Test-Path -LiteralPath $qp)) { return @{ Success = $false; Message = 'quarantined .reg file is missing' } }
+                $chk = Test-QuarantinePayloadPath $qp
+                if (-not $chk.Safe) { return @{ Success = $false; Message = ('the saved registry backup cannot be used: ' + [string]$chk.Reason) } }
+                $tchk = Test-SafeRegistryRestoreTarget -Type 'UninstallEntry' -Path $orig
+                if (-not $tchk.Safe) { return @{ Success = $false; Message = ('refusing to restore this uninstall entry: ' + [string]$tchk.Reason) } }
+                $rc = Test-RegFileMatchesKey -RegFile $qp -KeyPath $orig
+                if (-not $rc.Safe) { return @{ Success = $false; Message = ('the registry backup was refused: ' + [string]$rc.Reason) } }
                 & reg.exe import $qp | Out-Null
                 if ($LASTEXITCODE -ne 0) { throw 'reg import failed' }
             }
             'RunValue' {
-                if (-not $qp -or -not (Test-Path -LiteralPath $qp)) { return @{ Success = $false; Message = 'quarantined .reg file is missing' } }
-                & reg.exe import $qp | Out-Null
-                if ($LASTEXITCODE -ne 0) { throw 'reg import failed' }
+                $parts = $orig -split '\|', 2
+                if ($parts.Count -lt 2 -or [string]::IsNullOrWhiteSpace($parts[1])) { throw 'invalid run value path' }
+                $keyPath = ConvertTo-PSRegPath $parts[0]
+                $valName = [string]$parts[1]
+                $data = $null
+                if ($e.ContainsKey('Data')) { $data = $e['Data'] }
+                if ($data -is [System.Collections.IDictionary]) {
+                    $kind = [string]$data['Kind']
+                    $val = $data['Value']
+                    $okKinds = @('String', 'ExpandString', 'DWord', 'QWord', 'MultiString', 'Binary')
+                    if ($okKinds -notcontains $kind) { throw 'the saved startup value has an unsupported type' }
+                    if ($kind -eq 'Binary') { $val = [byte[]]@($val) }
+                    elseif ($kind -eq 'MultiString') { $val = [string[]]@($val) }
+                    elseif ($kind -eq 'DWord') { $val = [int]$val }
+                    elseif ($kind -eq 'QWord') { $val = [long]$val }
+                    else { $val = [string]$val }
+                    if (-not $keyPath -or -not (Test-Path -LiteralPath $keyPath)) { throw 'the startup key no longer exists' }
+                    Set-ItemProperty -LiteralPath $keyPath -Name $valName -Value $val -Type $kind -ErrorAction Stop
+                } else {
+                    $chk = Test-QuarantinePayloadPath $qp
+                    if (-not $chk.Safe) { return @{ Success = $false; Message = ('the saved registry backup cannot be used: ' + [string]$chk.Reason) } }
+                    $rc = Test-RegFileMatchesKey -RegFile $qp -KeyPath $parts[0]
+                    if (-not $rc.Safe) { return @{ Success = $false; Message = ('the registry backup was refused: ' + [string]$rc.Reason) } }
+                    & reg.exe import $qp | Out-Null
+                    if ($LASTEXITCODE -ne 0) { throw 'reg import failed' }
+                }
             }
             'Task' {
-                if (-not $qp -or -not (Test-Path -LiteralPath $qp)) { return @{ Success = $false; Message = 'quarantined task XML is missing' } }
+                $chk = Test-QuarantinePayloadPath $qp
+                if (-not $chk.Safe) { return @{ Success = $false; Message = ('the saved task XML cannot be used: ' + [string]$chk.Reason) } }
+                $tchk = Test-SafeRestoreTarget -Type 'Task' -Path $orig
+                if (-not $tchk.Safe) { return @{ Success = $false; Message = ('refusing to restore this task: ' + [string]$tchk.Reason) } }
+                $doc = $null
+                try {
+                    $doc = New-Object System.Xml.XmlDocument
+                    $doc.Load($qp)
+                } catch { throw 'the saved task file is not valid XML' }
+                if (-not $doc.DocumentElement -or $doc.DocumentElement.LocalName -ne 'Task') { throw 'the saved task file is not a task definition' }
                 $out = (& schtasks.exe /create /tn $orig /xml $qp /f 2>&1 | Out-String)
                 if ($LASTEXITCODE -ne 0) { throw ('schtasks restore failed: ' + $out.Trim()) }
             }
@@ -2368,7 +3468,7 @@ function Restore-QuarantineEntry {
                 return @{ Success = $false; Message = ('unknown item type: ' + $type) }
             }
         }
-        Set-QuarantineEntryFlag -Id ([int]$e['Id']) -Field 'Restored' -Value $true
+        Set-QuarantineEntryFlag -Id $id -Field 'Restored' -Value $true
         Write-FileLog ('Restored from quarantine: ' + $orig)
         return @{ Success = $true; Message = 'restored' }
     } catch {
@@ -2378,13 +3478,21 @@ function Restore-QuarantineEntry {
 
 function Remove-QuarantineEntry {
     param($Entry)
-    $e = ConvertTo-HashtableDeep $Entry
+    $snap = ConvertTo-HashtableDeep $Entry
+    $id = 0
+    try { $id = [int]$snap['Id'] } catch { $id = 0 }
+    if ($id -le 0) { return @{ Success = $false; Message = 'invalid quarantine entry' } }
+    $e = Get-QuarantineEntryById -Id $id
+    if (-not $e) { return @{ Success = $false; Message = 'the quarantine entry is no longer in the manifest' } }
     $qp = [string]$e['QuarantinePath']
     try {
         if ($qp -and (Test-Path -LiteralPath $qp)) {
-            Remove-Item -LiteralPath $qp -Recurse -Force -ErrorAction Stop
+            $chk = Test-QuarantinePayloadPath $qp
+            if (-not $chk.Safe) { return @{ Success = $false; Message = ('refusing to delete this path: ' + [string]$chk.Reason) } }
+            $del = Remove-TreeSafely -Path $qp
+            if ([int]$del.Skipped -gt 0) { return @{ Success = $false; Message = ('some files could not be deleted (' + [string]$del.Skipped + ' skipped)') } }
         }
-        Set-QuarantineEntryFlag -Id ([int]$e['Id']) -Field 'Restored' -Value $true
+        Set-QuarantineEntryFlag -Id $id -Field 'Restored' -Value $true
         Write-FileLog ('Quarantine payload deleted: ' + $qp)
         return @{ Success = $true; Message = 'deleted' }
     } catch {
@@ -2556,8 +3664,21 @@ function Show-LeftoverReviewDialog {
         $label = '[' + [string]$item.Type + ']  ' + [string]$item.Path
         if ($item.Detail -and ([string]$item.Detail -ne [string]$item.Path)) { $label = $label + '   -   ' + [string]$item.Detail }
         if ($item.InUse -eq $true) { $label = $label + '   [in use - close the app first]' }
+        $conf = 'Unknown'
+        try {
+            if ($item -is [System.Collections.IDictionary]) {
+                if ($item.Contains('Confidence')) { $conf = [string]$item['Confidence'] }
+            } elseif ($item.PSObject.Properties.Name -contains 'Confidence') {
+                $conf = [string]$item.Confidence
+            }
+        } catch { $conf = 'Unknown' }
         if ($item.Safe -eq $true) {
-            $cb.IsChecked = ($item.InUse -ne $true)
+            if ($conf -eq 'High' -and $item.InUse -ne $true) {
+                $cb.IsChecked = $true
+            } else {
+                $cb.IsChecked = $false
+                $label = $label + '   [review - ' + $conf.ToLower() + ' confidence match]'
+            }
             $cb.Content = $label
         } else {
             $cb.IsChecked = $false
@@ -3863,12 +4984,16 @@ function Apply-CurrentPreset {
 }
 
 $WingetListBody = @'
-if (-not (Test-WinGetAvailable)) { throw 'winget is not available' }
-$out = (& winget.exe list --accept-source-agreements 2>$null | Out-String)
-$rows = ConvertFrom-WingetTable $out
+$r = Invoke-WingetCli -Arguments @('list', '--accept-source-agreements') -TimeoutSeconds 120 -Attempts 2
+if ($r.TimedOut) { throw ('winget list did not respond: ' + [string]$r.Message) }
+if ($r.ExitCode -ne 0) {
+    $tail = (@(($r.Out + ' ' + $r.Err) -split "`r?`n") | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 3) -join ' / '
+    throw ('winget list failed with exit code ' + $r.ExitCode + ': ' + $tail)
+}
+$rows = ConvertFrom-WingetTable $r.Out
 $arr = New-Object System.Collections.Generic.List[object]
-foreach ($r in $rows) {
-    if ($r.Id) { $arr.Add([PSCustomObject]@{ Id = $r.Id; Name = $r.Name; Version = $r.Version }) }
+foreach ($row in $rows) {
+    if ($row.Id) { [void]$arr.Add([PSCustomObject]@{ Id = $row.Id; Name = $row.Name; Version = $row.Version }) }
 }
 if ($arr.Count -eq 0) { $json = '[]' } else { $json = @($arr.ToArray()) | ConvertTo-Json -Depth 5 }
 [System.IO.File]::WriteAllText(($log + '.json'), $json, (New-Object System.Text.UTF8Encoding($false)))
@@ -3877,12 +5002,16 @@ W('DONE')
 '@
 
 $UpgradeScanBody = @'
-if (-not (Test-WinGetAvailable)) { throw 'winget is not available' }
-$out = (& winget.exe upgrade --accept-source-agreements 2>$null | Out-String)
-$rows = ConvertFrom-WingetTable $out
+$r = Invoke-WingetCli -Arguments @('upgrade', '--accept-source-agreements') -TimeoutSeconds 300 -Attempts 2
+if ($r.TimedOut) { throw ('winget upgrade did not respond: ' + [string]$r.Message) }
+if ($r.ExitCode -ne 0) {
+    $tail = (@(($r.Out + ' ' + $r.Err) -split "`r?`n") | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 3) -join ' / '
+    throw ('winget upgrade scan failed with exit code ' + $r.ExitCode + ': ' + $tail)
+}
+$rows = ConvertFrom-WingetTable $r.Out
 $arr = New-Object System.Collections.Generic.List[object]
-foreach ($r in $rows) {
-    if ($r.Id) { $arr.Add([PSCustomObject]@{ Id = $r.Id; Name = $r.Name; Version = $r.Version; Available = $r.Available }) }
+foreach ($row in $rows) {
+    if ($row.Id) { [void]$arr.Add([PSCustomObject]@{ Id = $row.Id; Name = $row.Name; Version = $row.Version; Available = $row.Available }) }
 }
 if ($arr.Count -eq 0) { $json = '[]' } else { $json = @($arr.ToArray()) | ConvertTo-Json -Depth 5 }
 [System.IO.File]::WriteAllText(($log + '.json'), $json, (New-Object System.Text.UTF8Encoding($false)))
@@ -3891,7 +5020,6 @@ W('DONE')
 '@
 
 $InstallBody = @'
-if (-not (Test-WinGetAvailable)) { throw 'winget is not available' }
 $apps = @($Payload['Apps'])
 $results = New-Object System.Collections.Generic.List[object]
 $i = 0
@@ -3900,15 +5028,30 @@ foreach ($a in $apps) {
     $id = [string]$a['Id']
     $nm = [string]$a['Name']
     W('(' + $i + '/' + $apps.Count + ') Installing ' + $nm + '  [' + $id + '] ...')
-    $out = (& winget.exe install --id $id --exact --silent --accept-package-agreements --accept-source-agreements 2>&1 | Out-String)
-    $code = $LASTEXITCODE
-    $ok = ($code -eq 0) -or ($code -eq -1978335189)
-    if ($ok) { W('  OK') }
-    else {
-        W('  exit code: ' + $code)
-        foreach ($ln in (@($out -split "`r?`n") | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 3)) { W('  ' + $ln) }
+    $r = Invoke-WingetCli -Arguments @('install', '--id', $id, '--exact', '--silent', '--accept-package-agreements', '--accept-source-agreements') -TimeoutSeconds 1800 -Attempts 2
+    $code = $r.ExitCode
+    $ok = ((-not $r.TimedOut) -and (($code -eq 0) -or ($code -eq -1978335189)))
+    $verified = $false
+    if ($ok) {
+        $v = Invoke-WingetCli -Arguments @('list', '--id', $id, '--exact', '--accept-source-agreements') -TimeoutSeconds 120 -Attempts 1
+        $vr = @(ConvertFrom-WingetTable $v.Out)
+        foreach ($row in $vr) {
+            if ($row.Id -and ([string]$row.Id -ieq $id)) { $verified = $true; break }
+        }
     }
-    $results.Add([PSCustomObject]@{ Id = $id; Name = $nm; Code = $code; Ok = $ok })
+    $msg = [string]$r.Message
+    if ($r.TimedOut) { $msg = 'timed out' }
+    elseif (-not $ok) {
+        $msg = (@(($r.Out + ' ' + $r.Err) -split "`r?`n") | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 3) -join ' / '
+    }
+    if ($ok) {
+        if ($verified) { W('  OK (verified in the installed list)') }
+        else { W('  finished, but the package was not found in the installed list') }
+    } else {
+        W('  exit code: ' + $code)
+        if ($msg) { W('  ' + $msg) }
+    }
+    [void]$results.Add([PSCustomObject]@{ Id = $id; Name = $nm; Code = $code; Ok = $ok; Verified = $verified; TimedOut = [bool]$r.TimedOut; Message = $msg })
 }
 if ($results.Count -eq 0) { $json = '[]' } else { $json = @($results.ToArray()) | ConvertTo-Json -Depth 4 }
 [System.IO.File]::WriteAllText(($log + '.json'), $json, (New-Object System.Text.UTF8Encoding($false)))
@@ -3917,7 +5060,6 @@ W('DONE')
 '@
 
 $UpgradeBody = @'
-if (-not (Test-WinGetAvailable)) { throw 'winget is not available' }
 $apps = @($Payload['Apps'])
 $results = New-Object System.Collections.Generic.List[object]
 $i = 0
@@ -3926,15 +5068,20 @@ foreach ($a in $apps) {
     $id = [string]$a['Id']
     $nm = [string]$a['Name']
     W('(' + $i + '/' + $apps.Count + ') Upgrading ' + $nm + '  [' + $id + '] ...')
-    $out = (& winget.exe upgrade --id $id --exact --silent --accept-package-agreements --accept-source-agreements 2>&1 | Out-String)
-    $code = $LASTEXITCODE
-    $ok = ($code -eq 0) -or ($code -eq -1978335189)
+    $r = Invoke-WingetCli -Arguments @('upgrade', '--id', $id, '--exact', '--silent', '--accept-package-agreements', '--accept-source-agreements') -TimeoutSeconds 1800 -Attempts 2
+    $code = $r.ExitCode
+    $ok = ((-not $r.TimedOut) -and (($code -eq 0) -or ($code -eq -1978335189)))
+    $msg = [string]$r.Message
+    if ($r.TimedOut) { $msg = 'timed out' }
+    elseif (-not $ok) {
+        $msg = (@(($r.Out + ' ' + $r.Err) -split "`r?`n") | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 3) -join ' / '
+    }
     if ($ok) { W('  OK') }
     else {
         W('  exit code: ' + $code)
-        foreach ($ln in (@($out -split "`r?`n") | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 3)) { W('  ' + $ln) }
+        if ($msg) { W('  ' + $msg) }
     }
-    $results.Add([PSCustomObject]@{ Id = $id; Name = $nm; Code = $code; Ok = $ok })
+    [void]$results.Add([PSCustomObject]@{ Id = $id; Name = $nm; Code = $code; Ok = $ok; TimedOut = [bool]$r.TimedOut; Message = $msg })
 }
 if ($results.Count -eq 0) { $json = '[]' } else { $json = @($results.ToArray()) | ConvertTo-Json -Depth 4 }
 [System.IO.File]::WriteAllText(($log + '.json'), $json, (New-Object System.Text.UTF8Encoding($false)))
@@ -3945,14 +5092,41 @@ W('DONE')
 function Start-WingetJob {
     param(
         [string]$Kind, [string]$Title, [string]$BodyText,
-        $Payload = $null, [scriptblock]$OnDone = $null
+        $Payload = $null, [scriptblock]$OnDone = $null, [int]$TimeoutSeconds = 0
     )
+    if ($TimeoutSeconds -le 0) {
+        switch ($Kind) {
+            'wglist'  { $TimeoutSeconds = 180 }
+            'upgscan' { $TimeoutSeconds = 420 }
+            'install' {
+                $n = 1
+                try { $n = @($Payload['Apps']).Count } catch { $n = 1 }
+                if ($n -lt 1) { $n = 1 }
+                $TimeoutSeconds = 600 + (1800 * $n)
+            }
+            'upgrade' {
+                $n = 1
+                try { $n = @($Payload['Apps']).Count } catch { $n = 1 }
+                if ($n -lt 1) { $n = 1 }
+                $TimeoutSeconds = 600 + (1800 * $n)
+            }
+            'uninst'  { $TimeoutSeconds = 1500 }
+            'scan'    { $TimeoutSeconds = 900 }
+            'cleanup' { $TimeoutSeconds = 900 }
+            'appx'    { $TimeoutSeconds = 900 }
+            'defender'{ $TimeoutSeconds = 21600 }
+            default   { $TimeoutSeconds = 900 }
+        }
+    }
     $text = $WorkerSrc + [Environment]::NewLine + $BodyText
-    $null = Start-BgOperation -Kind $Kind -Title $Title -Body ([scriptblock]::Create($text)) -Payload $Payload -OnDone $OnDone
+    $null = Start-BgOperation -Kind $Kind -Title $Title -Body ([scriptblock]::Create($text)) -Payload $Payload -OnDone $OnDone -TimeoutSeconds $TimeoutSeconds
 }
 
 function Start-WingetListRefresh {
-    if (-not $script:WingetOk) { return }
+    if (-not $script:WingetOk) {
+        Write-Log 'Skipped the installed-apps refresh because winget was not detected.'
+        return
+    }
     $done = {
         param($result)
         if ($result.State -eq 'Completed' -and $result.Data) {
@@ -3964,7 +5138,10 @@ function Start-WingetListRefresh {
             $script:WgInstalled = $h
             Build-AppRows
             Write-Log ('Installed-apps cache updated: ' + $h.Count + ' packages.')
-        } elseif ($result.State -ne 'Completed') {
+        } elseif ($result.State -eq 'Completed') {
+            $script:WgInstalled = @{}
+            Write-Log 'The installed-apps list came back empty, so every catalog app is treated as not installed.'
+        } else {
             Write-Log ('Installed-apps refresh failed: ' + [string]$result.Error)
         }
     }
@@ -4056,17 +5233,31 @@ function Install-AppsSelected {
         }
         $okNames = @()
         $failLines = @()
-        foreach ($it in @($result.Data)) {
+        $unverified = 0
+        $items = @()
+        if ($result.Data) { $items = @($result.Data) }
+        if ($items.Count -eq 0) {
+            Show-Err 'The install finished but returned no per-app result, so STweak cannot confirm that anything was installed. Check the activity log.' 'Install'
+            Start-WingetListRefresh
+            return
+        }
+        foreach ($it in $items) {
             $d = ConvertTo-HashtableDeep $it
             if ([bool]$d['Ok']) {
                 $okNames += [string]$d['Name']
+                if ($d.ContainsKey('Verified') -and -not [bool]$d['Verified']) { $unverified++ }
                 Add-InstalledApp -WingetId ([string]$d['Id']) -DisplayName ([string]$d['Name'])
             } else {
-                $failLines += ([string]$d['Name'] + '  (exit code ' + [string]$d['Code'] + ')')
+                $line = [string]$d['Name'] + '  (exit code ' + [string]$d['Code'] + ')'
+                if ($d['Message']) { $line = $line + [Environment]::NewLine + '    ' + [string]$d['Message'] }
+                $failLines += $line
             }
         }
         Refresh-History
         $msg = 'Installed: ' + $okNames.Count
+        if ($unverified -gt 0) {
+            $msg = $msg + [Environment]::NewLine + $unverified + ' package(s) reported success but were not found in the installed list afterwards.'
+        }
         if ($failLines.Count -gt 0) {
             $msg = $msg + '    Failed: ' + $failLines.Count + [Environment]::NewLine + ($failLines -join [Environment]::NewLine)
             Show-Err $msg 'Install result'
@@ -4138,9 +5329,22 @@ function Upgrade-AppsSelected {
         }
         $ok = 0
         $failLines = @()
-        foreach ($it in @($result.Data)) {
+        $items = @()
+        if ($result.Data) { $items = @($result.Data) }
+        if ($items.Count -eq 0) {
+            Show-Err 'The upgrade finished but returned no per-app result, so STweak cannot confirm that anything was upgraded. Check the activity log.' 'Upgrade'
+            $script:PnlUpgrades.Children.Clear()
+            Start-WingetListRefresh
+            return
+        }
+        foreach ($it in $items) {
             $d = ConvertTo-HashtableDeep $it
-            if ([bool]$d['Ok']) { $ok++ } else { $failLines += ([string]$d['Name'] + '  (exit code ' + [string]$d['Code'] + ')') }
+            if ([bool]$d['Ok']) { $ok++ }
+            else {
+                $line = [string]$d['Name'] + '  (exit code ' + [string]$d['Code'] + ')'
+                if ($d['Message']) { $line = $line + [Environment]::NewLine + '    ' + [string]$d['Message'] }
+                $failLines += $line
+            }
         }
         $msg = 'Upgraded: ' + $ok
         if ($failLines.Count -gt 0) {
@@ -4209,9 +5413,11 @@ function Start-DeepScan {
     $pub = ''
     $loc = ''
     $cmd = ''
+    $entryKey = ''
     if ($entry) {
         $pub = [string]$entry.Publisher
         $loc = [string]$entry.InstallLocation
+        $entryKey = [string]$entry.KeyPath
         if ([string]$entry.QuietUninstallString) { $cmd = [string]$entry.QuietUninstallString }
         else { $cmd = [string]$entry.UninstallString }
     }
@@ -4226,6 +5432,7 @@ function Start-DeepScan {
         Publisher        = $pub
         InstallLocation  = $loc
         UninstallCommand = $cmd
+        EntryKey         = $entryKey
         RunUninstaller   = $ranUninstaller
     }
     $done = {
@@ -4274,8 +5481,24 @@ function Get-PathSizeBytes {
     if (-not $Path) { return $sum }
     try {
         if (-not (Test-Path -LiteralPath $Path)) { return $sum }
-        foreach ($f in @(Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue)) {
-            try { $sum += [long]$f.Length } catch { }
+        $base = Get-NormalizedPath $Path
+        if (-not $base) { return $sum }
+        $count = 0
+        $stack = New-Object System.Collections.Generic.Stack[string]
+        $stack.Push($base)
+        while ($stack.Count -gt 0 -and $count -lt 300000) {
+            $dir = $stack.Pop()
+            $entries = @()
+            try { $entries = @([System.IO.Directory]::GetFileSystemEntries($dir)) } catch { continue }
+            foreach ($ent in $entries) {
+                $it = $null
+                try { $it = Get-Item -LiteralPath $ent -Force -ErrorAction SilentlyContinue } catch { $it = $null }
+                if (-not $it) { continue }
+                if (([int]($it.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) -ne 0) { continue }
+                if ($it.PSIsContainer) { $stack.Push($it.FullName); continue }
+                try { $sum += [long]$it.Length; $count++ } catch { }
+                if ($count -ge 300000) { break }
+            }
         }
     } catch { }
     return $sum
@@ -4300,8 +5523,23 @@ function Get-JobPathSize {
     if (-not $Path) { return $sum }
     try {
         if (-not (Test-Path -LiteralPath $Path)) { return $sum }
-        foreach ($f in @(Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue)) {
-            try { $sum += [long]$f.Length } catch { }
+        $base = [System.IO.Path]::GetFullPath($Path.Trim()).TrimEnd('\')
+        $count = 0
+        $stack = New-Object System.Collections.Generic.Stack[string]
+        $stack.Push($base)
+        while ($stack.Count -gt 0 -and $count -lt 300000) {
+            $dir = $stack.Pop()
+            $entries = @()
+            try { $entries = @([System.IO.Directory]::GetFileSystemEntries($dir)) } catch { continue }
+            foreach ($ent in $entries) {
+                $it = $null
+                try { $it = Get-Item -LiteralPath $ent -Force -ErrorAction SilentlyContinue } catch { $it = $null }
+                if (-not $it) { continue }
+                if (([int]($it.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) -ne 0) { continue }
+                if ($it.PSIsContainer) { $stack.Push($it.FullName); continue }
+                try { $sum += [long]$it.Length; $count++ } catch { }
+                if ($count -ge 300000) { break }
+            }
         }
     } catch { }
     return $sum
@@ -4334,23 +5572,37 @@ foreach ($t in $targets) {
             W('  Recycle Bin note: ' + $_.Exception.Message)
         }
     } elseif ($kind -eq 'Dir') {
+        $del = 0
+        $skip = 0
         foreach ($p in $paths) {
             if (-not (Test-Path -LiteralPath $p)) { continue }
             foreach ($k in @(Get-ChildItem -LiteralPath $p -Force -ErrorAction SilentlyContinue)) {
-                try { Remove-Item -LiteralPath $k.FullName -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+                $r = Remove-TreeSafely -Path $k.FullName
+                $del += [int]$r.Deleted
+                $skip += [int]$r.Skipped
+                if ([int]$r.Skipped -gt 0) { W('  skipped ' + $k.FullName + ' (in use, locked or a link)') }
             }
         }
+        W('  deleted: ' + $del + '  skipped: ' + $skip)
     } elseif ($kind -eq 'Files') {
+        $del = 0
+        $skip = 0
         foreach ($p in $paths) {
             if (-not (Test-Path -LiteralPath $p)) { continue }
             foreach ($k in @(Get-ChildItem -LiteralPath $p -Force -File -ErrorAction SilentlyContinue)) {
                 $hit = $false
                 foreach ($pat in $patterns) { if ($k.Name -like $pat) { $hit = $true; break } }
-                if ($hit) {
-                    try { Remove-Item -LiteralPath $k.FullName -Force -ErrorAction SilentlyContinue } catch { }
+                if (-not $hit) { continue }
+                try {
+                    Remove-Item -LiteralPath $k.FullName -Force -ErrorAction Stop
+                    $del++
+                } catch {
+                    $skip++
+                    W('  skipped ' + $k.FullName + ': ' + $_.Exception.Message)
                 }
             }
         }
+        W('  deleted files: ' + $del + '  skipped: ' + $skip)
     }
     $after = [long]0
     if ($kind -ne 'Recycle') {
@@ -4398,18 +5650,35 @@ function Start-CleanupRunning {
         }
     }
     if ($sel.Count -eq 0) { Show-Info 'Select at least one item to clean.'; return }
-    $lines = @()
-    foreach ($t in $sel.ToArray()) { $lines += ('CLEAN: ' + [string]$t['Title']) }
-    if (-not (Show-ConfirmDialog -Title ('Clean ' + $sel.Count + ' location(s)?') -Lines $lines -Notes @('Files that are currently in use are skipped automatically. The Recycle Bin option empties all drives.'))) { return }
+    $hasRecycle = $false
+    foreach ($t in $sel.ToArray()) { if ([string]$t['Kind'] -eq 'Recycle') { $hasRecycle = $true; break } }
+    if ($hasRecycle -and $sel.Count -gt 1) {
+        Show-Err 'The Recycle Bin cannot be emptied together with other locations. Untick either the Recycle Bin or the other items and run them separately.' 'Cleanup'
+        return
+    }
+    if ($hasRecycle) {
+        if (-not (Show-ConfirmDialog -Title 'Empty the Recycle Bin on all drives?' -Lines @('Every drive''s Recycle Bin will be emptied permanently.') -Notes @('Files in the Recycle Bin cannot be quarantined or restored by STweak. This step cannot be undone.'))) { return }
+    } else {
+        $lines = @()
+        foreach ($t in $sel.ToArray()) { $lines += ('CLEAN: ' + [string]$t['Title']) }
+        if (-not (Show-ConfirmDialog -Title ('Clean ' + $sel.Count + ' location(s)?') -Lines $lines -Notes @('Files that are currently in use and links (junctions) are skipped automatically.'))) { return }
+    }
     $done = {
         param($result)
         if ($result.State -ne 'Completed') {
             Show-Err ('The cleanup did not finish (' + $result.State + ').' + [Environment]::NewLine + [string]$result.Error) 'Cleanup'
             return
         }
+        $items = @()
+        if ($result.Data) { $items = @($result.Data) }
+        if ($items.Count -eq 0) {
+            Show-Err 'The cleanup finished but returned no result, so STweak cannot confirm what was removed. Check the activity log.' 'Cleanup'
+            Invoke-CleanupAnalyze
+            return
+        }
         $freed = [long]0
         $linesOut = @()
-        foreach ($it in @($result.Data)) {
+        foreach ($it in $items) {
             $d = ConvertTo-HashtableDeep $it
             if (-not $d) { continue }
             $f = [long]0
@@ -4460,13 +5729,20 @@ foreach ($p in $pkgs) {
     $fn = [string]$p['FullName']
     W('Removing: ' + $dn)
     $ok = $false
+    $msg = ''
     try {
         Remove-AppxPackage -Package $fn -ErrorAction Stop
         W('  removed for the current user.')
         $ok = $true
     } catch {
-        W('  FAILED: ' + $_.Exception.Message)
+        $msg = $_.Exception.Message
+        W('  FAILED: ' + $msg)
     }
+    $still = $true
+    try { $still = [bool](Get-AppxPackage -PackageFullName $fn -ErrorAction SilentlyContinue) } catch { $still = $true }
+    $verified = (-not $still)
+    if ($ok -and $verified) { W('  verified: the package is gone for the current user.') }
+    elseif ($ok) { W('  the package is still listed after removal.') }
     if ($prov) {
         foreach ($pp in $provList) {
             if ($pp.DisplayName -eq $dn) {
@@ -4479,7 +5755,7 @@ foreach ($p in $pkgs) {
             }
         }
     }
-    $results.Add([PSCustomObject]@{ Name = $dn; Ok = $ok })
+    $results.Add([PSCustomObject]@{ Name = $dn; Ok = ($ok -and $verified); Attempted = $ok; Verified = $verified; Message = $msg })
 }
 if ($results.Count -eq 0) { $json = '[]' } else { $json = @($results.ToArray()) | ConvertTo-Json -Depth 4 }
 [System.IO.File]::WriteAllText(($log + '.json'), $json, (New-Object System.Text.UTF8Encoding($false)))
@@ -4515,13 +5791,23 @@ function Remove-SelectedAppx {
         }
         $ok = 0
         $fails = @()
-        foreach ($it in @($result.Data)) {
+        $items = @()
+        if ($result.Data) { $items = @($result.Data) }
+        if ($items.Count -eq 0) {
+            Show-Err 'The AppX removal finished but returned no result, so STweak cannot confirm anything was removed. Check the activity log.' 'Bloatware'
+            Load-AppxPackages
+            return
+        }
+        foreach ($it in $items) {
             $d = ConvertTo-HashtableDeep $it
             if ($d -and [bool]$d['Ok']) { $ok++ }
             else {
                 $nm = '(unknown)'
                 if ($d -and $d['Name']) { $nm = [string]$d['Name'] }
-                $fails += ($nm + ' could not be removed')
+                $why = ''
+                if ($d -and $d['Message']) { $why = ' (' + [string]$d['Message'] + ')' }
+                elseif ($d -and $d['Verified'] -eq $false) { $why = ' (still listed after removal)' }
+                $fails += ($nm + ' could not be removed' + $why)
             }
         }
         if ($fails.Count -gt 0) {
@@ -4664,19 +5950,33 @@ function Start-DefenderAction {
 $script:ClosingOk = $false
 
 $WingetUninstallBody = @'
-if (-not (Test-WinGetAvailable)) { throw 'winget is not available' }
 $id = [string]$Payload['Id']
 $nm = [string]$Payload['Name']
 W('Uninstalling: ' + $nm + '  [' + $id + ']')
-$out = (& winget.exe uninstall --id $id --exact --silent --accept-source-agreements 2>&1 | Out-String)
-$code = $LASTEXITCODE
-$ok = ($code -eq 0) -or ($code -eq -1978335189)
-if ($ok) { W('  OK') }
+$r = Invoke-WingetCli -Arguments @('uninstall', '--id', $id, '--exact', '--silent', '--accept-source-agreements') -TimeoutSeconds 1200 -Attempts 2
+$code = $r.ExitCode
+$ok = ((-not $r.TimedOut) -and (($code -eq 0) -or ($code -eq -1978335189)))
+$verified = $false
+if ($ok) {
+    $v = Invoke-WingetCli -Arguments @('list', '--id', $id, '--exact', '--accept-source-agreements') -TimeoutSeconds 120 -Attempts 1
+    $still = $false
+    foreach ($row in @(ConvertFrom-WingetTable $v.Out)) {
+        if ($row.Id -and ([string]$row.Id -ieq $id)) { $still = $true; break }
+    }
+    $verified = (-not $still)
+}
+$msg = [string]$r.Message
+if ($r.TimedOut) { $msg = 'timed out' }
+elseif (-not $ok) {
+    $msg = (@(($r.Out + ' ' + $r.Err) -split "`r?`n") | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 3) -join ' / '
+}
+if ($ok -and $verified) { W('  OK (the package is no longer listed)') }
+elseif ($ok) { W('  the package is still listed after the uninstall command') }
 else {
     W('  exit code: ' + $code)
-    foreach ($ln in (@($out -split "`r?`n") | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 3)) { W('  ' + $ln) }
+    if ($msg) { W('  ' + $msg) }
 }
-$obj = [PSCustomObject]@{ Id = $id; Name = $nm; Ok = $ok; Code = $code }
+$obj = [PSCustomObject]@{ Id = $id; Name = $nm; Ok = ($ok -and $verified); Attempted = $ok; Verified = $verified; Code = $code; TimedOut = [bool]$r.TimedOut; Message = $msg }
 [System.IO.File]::WriteAllText(($log + '.json'), ($obj | ConvertTo-Json -Depth 3), (New-Object System.Text.UTF8Encoding($false)))
 W('DONE')
 '@
@@ -4760,13 +6060,24 @@ function Refresh-History {
                         return
                     }
                     $d = ConvertTo-HashtableDeep $result.Data
-                    if ($d -and [bool]$d['Ok']) {
+                    if (-not $d -or -not $d['Id']) {
+                        Show-Err ('The uninstall finished but returned no result, so STweak cannot confirm that ' + $nmVal + ' was removed. Check the activity log.') 'Uninstall'
+                        Refresh-History
+                        Start-WingetListRefresh
+                        return
+                    }
+                    if ([bool]$d['Ok']) {
                         Remove-InstalledAppEntry -WingetId $idVal
                         Show-Info ('Uninstalled: ' + $nmVal) 'Uninstall'
                     } else {
                         $codeText = 'unknown'
-                        if ($d -and $d['Code']) { $codeText = [string]$d['Code'] }
-                        Show-Err ('Could not uninstall ' + $nmVal + '   (exit code ' + $codeText + ').') 'Uninstall'
+                        if ($d['Code']) { $codeText = [string]$d['Code'] }
+                        $extra = ''
+                        if ($d['Message']) { $extra = [Environment]::NewLine + [string]$d['Message'] }
+                        if ($d['Attempted'] -eq $true -and $d['Verified'] -eq $false) {
+                            $extra = $extra + [Environment]::NewLine + 'The package is still listed after the uninstall command.'
+                        }
+                        Show-Err ('Could not uninstall ' + $nmVal + '   (exit code ' + $codeText + ').' + $extra) 'Uninstall'
                     }
                     Refresh-History
                     Start-WingetListRefresh
@@ -5046,6 +6357,7 @@ function Set-HealthShield {
 
 function Update-HomeHealth {
     $issues = New-Object System.Collections.Generic.List[string]
+    $unknown = New-Object System.Collections.Generic.List[string]
     try {
         $mp = Get-MpComputerStatus -ErrorAction Stop
         if ($mp) {
@@ -5054,22 +6366,32 @@ function Update-HomeHealth {
                 $age = [int]$mp.AntivirusSignatureAge
                 if (($age -gt 7) -and ($age -lt 1000)) { [void]$issues.Add('Defender signatures are ' + $age + ' days old') }
             }
+        } else {
+            [void]$unknown.Add('Defender status')
         }
-    } catch { }
+    } catch { [void]$unknown.Add('Defender status') }
     try {
-        $fw = Get-NetFirewallProfile -ErrorAction Stop
-        foreach ($fp in @($fw)) {
+        $fw = @(Get-NetFirewallProfile -ErrorAction Stop)
+        if ($fw.Count -eq 0) { [void]$unknown.Add('firewall status') }
+        foreach ($fp in $fw) {
             if ($fp.Enabled -eq $false) { [void]$issues.Add('A firewall profile is disabled'); break }
         }
-    } catch { }
+    } catch { [void]$unknown.Add('firewall status') }
     try {
         $d = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction Stop
         if ($d -and ([double]$d.Size -gt 0)) {
             $freeGb = [math]::Round([double]$d.FreeSpace / 1GB, 1)
             if ($freeGb -lt 10) { [void]$issues.Add('Low disk space: only ' + $freeGb + ' GB free on C:') }
+        } else {
+            [void]$unknown.Add('disk space')
         }
-    } catch { }
-    if ($issues.Count -eq 0) {
+    } catch { [void]$unknown.Add('disk space') }
+    if ($issues.Count -eq 0 -and $unknown.Count -gt 0) {
+        if ($script:TxtHealthTitle) { $script:TxtHealthTitle.Text = 'Could not verify everything' }
+        if ($script:TxtHealthTitle) { $script:TxtHealthTitle.Foreground = $script:BrAmber }
+        if ($script:TxtHealthSub) { $script:TxtHealthSub.Text = 'No problems were found in the checks that ran, but these could not be read: ' + ($unknown.ToArray() -join ', ') + '.' }
+        Set-HealthShield $false
+    } elseif ($issues.Count -eq 0) {
         if ($script:TxtHealthTitle) { $script:TxtHealthTitle.Text = 'Your PC is in great shape' }
         if ($script:TxtHealthTitle) { $script:TxtHealthTitle.Foreground = $script:BrGreen }
         if ($script:TxtHealthSub) { $script:TxtHealthSub.Text = 'No problems found - Defender, firewall and disk space all look good.' }
@@ -5077,7 +6399,9 @@ function Update-HomeHealth {
     } else {
         if ($script:TxtHealthTitle) { $script:TxtHealthTitle.Text = 'A few things need attention' }
         if ($script:TxtHealthTitle) { $script:TxtHealthTitle.Foreground = $script:BrAmber }
-        if ($script:TxtHealthSub) { $script:TxtHealthSub.Text = ($issues.ToArray() -join '.  ') + '.' }
+        $sub = ($issues.ToArray() -join '.  ') + '.'
+        if ($unknown.Count -gt 0) { $sub = $sub + '  Could not check: ' + ($unknown.ToArray() -join ', ') + '.' }
+        if ($script:TxtHealthSub) { $script:TxtHealthSub.Text = $sub }
         Set-HealthShield $false
     }
 }
@@ -5260,10 +6584,20 @@ function Wire-EventHandlers {
     $script:BtnClearActivityLog.Add_Click({ $script:TxtActivityLog.Clear() })
 
     $script:BtnCancelJob.Add_Click({
-        if (-not $script:BgJob) { return }
-        if (Ask-YesNo 'Stop the running operation?' 'STweak') {
-            try { Stop-Job -Job $script:BgJob -ErrorAction SilentlyContinue } catch { }
-            Write-Log 'Stop was requested for the running operation.'
+        if (-not $script:BgJob) {
+            if ($script:BgPending) {
+                $script:BgPending = $null
+                Write-Log 'The queued operation was cancelled.'
+                if ($script:TxtBgState) { $script:TxtBgState.Text = 'Ready' }
+            }
+            return
+        }
+        if (Ask-YesNo 'Stop the running operation? A queued operation will also be cancelled.' 'STweak') {
+            if ($script:BgPending) {
+                $script:BgPending = $null
+                Write-Log 'The queued operation was cancelled.'
+            }
+            Stop-BgOperation -Reason 'cancelled by the user'
         }
     })
 
@@ -5351,7 +6685,20 @@ if ($ValidateOnly) {
     foreach ($bc in $bodyChecks) {
         try { $null = [scriptblock]::Create($WorkerSrc + $nl + $bc.Text) }
         catch { [void]$fails.Add($bc.Name + ' does not compile: ' + $_.Exception.Message) }
+        if ($bc.Text -match '(?i)\bcmd(\.exe)?\s*/c') { [void]$fails.Add($bc.Name + ' still runs commands through cmd /c') }
+        if ($bc.Text -match '(?i)&\s*winget\.exe') { [void]$fails.Add($bc.Name + ' still calls winget.exe without a timeout') }
     }
+
+    foreach ($fn in @('Get-TreeFingerprint', 'Remove-TreeSafely', 'Get-MatchConfidence', 'Test-SafeShortcutPath', 'Test-SafeRegistryPath', 'Test-SafeRunValuePath', 'Test-SafeServiceName', 'Get-UninstallerPolicy', 'Get-WingetExePath', 'Invoke-WingetCli', 'Stop-BgOperation', 'Start-PendingBgOperation', 'Get-DefenderSettingRestore', 'Get-DefenderSettingStatus', 'Test-QuarantinePayloadPath', 'Test-SafeRestoreTarget', 'Test-SafeRegistryRestoreTarget', 'Test-RegFileMatchesKey', 'Get-QuarantineEntryById', 'Set-RestrictedDataAcl')) {
+        if (-not (Get-Command -Name $fn -CommandType Function -ErrorAction SilentlyContinue)) { [void]$fails.Add('missing safety helper: ' + $fn) }
+    }
+
+    $restoreSrc = (Get-Command -Name 'Restore-QuarantineEntry' -CommandType Function -ErrorAction SilentlyContinue).Definition
+    foreach ($needle in @('Test-QuarantinePayloadPath', 'Test-SafeRestoreTarget', 'Test-SafeRegistryRestoreTarget', 'Test-RegFileMatchesKey')) {
+        if ($restoreSrc -notmatch [regex]::Escape($needle)) { [void]$fails.Add('Restore-QuarantineEntry does not use ' + $needle) }
+    }
+    $removeSrc = (Get-Command -Name 'Remove-QuarantineEntry' -CommandType Function -ErrorAction SilentlyContinue).Definition
+    if ($removeSrc -notmatch 'Test-QuarantinePayloadPath') { [void]$fails.Add('Remove-QuarantineEntry does not confine the payload path') }
 
     if ($TweakCatalog.Count -lt 40) { [void]$fails.Add('the tweak catalog looks too small: ' + $TweakCatalog.Count) }
     $keys = @{}
@@ -5438,10 +6785,437 @@ W('DONE')
     Write-Host ('Tweaks: ' + $TweakCatalog.Count + '   Apps: ' + $AppCatalog.Count + '   Presets: ' + $Presets.Count)
     if ($fails.Count -eq 0) {
         Write-Host 'VALIDATION OK'
+        Remove-TempStateIfAny
         exit 0
     }
     foreach ($f in $fails) { Write-Host ('FAIL: ' + $f) }
     Write-Host 'VALIDATION FAILED'
+    Remove-TempStateIfAny
+    exit 1
+}
+
+if ($SelfTest) {
+    $script:SelfFails = New-Object System.Collections.Generic.List[string]
+    $script:SelfPass = 0
+    $tmpRoot = Join-Path $env:TEMP ('STweakSelfTest_' + $PID)
+    if (Test-Path -LiteralPath $tmpRoot) { Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    New-Item -ItemType Directory -Path $tmpRoot -Force | Out-Null
+
+    function T {
+        param([string]$Name, [scriptblock]$Body)
+        try {
+            $r = & $Body
+            if ($null -eq $r -or $r -eq $true) {
+                $script:SelfPass = [int]$script:SelfPass + 1
+                Write-Host ('PASS: ' + $Name)
+            } else {
+                [void]$script:SelfFails.Add($Name + ': ' + [string]$r)
+                Write-Host ('FAIL: ' + $Name + ' - ' + [string]$r)
+            }
+        } catch {
+            [void]$script:SelfFails.Add($Name + ': ' + $_.Exception.Message)
+            Write-Host ('FAIL: ' + $Name + ' - ' + $_.Exception.Message)
+        }
+    }
+
+    Write-Host ''
+    Write-Host 'STweak self-test'
+    Write-Host ('Temp folder: ' + $tmpRoot)
+    if (-not (Test-IsAdmin)) { Write-Host 'NOTE: not elevated; tests that need admin rights will report a failure instead of changing the system.' }
+    Write-Host ''
+
+    T 'tree fingerprint counts files and bytes' {
+        $a = Join-Path $tmpRoot 'fp_src'
+        New-Item -ItemType Directory -Path (Join-Path $a 'sub') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $a 'one.txt') -Value 'hello' -Encoding UTF8
+        Set-Content -LiteralPath (Join-Path $a 'sub\two.txt') -Value 'world!!' -Encoding UTF8
+        $fp = Get-TreeFingerprint $a
+        if ([int]$fp.Count -ne 2) { return ('expected 2 files, got ' + $fp.Count) }
+        if ([long]$fp.Bytes -le 0) { return 'the byte counter stayed at zero' }
+        $single = Get-TreeFingerprint (Join-Path $a 'one.txt')
+        if ([int]$single.Count -ne 1) { return 'a single file was not fingerprinted' }
+        return $null
+    }
+
+    T 'copy-move keeps every byte and removes the source' {
+        $a = Join-Path $tmpRoot 'mv_src'
+        $b = Join-Path $tmpRoot 'mv_dst'
+        New-Item -ItemType Directory -Path (Join-Path $a 'sub') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $a 'a.txt') -Value ('x' * 512) -Encoding UTF8
+        Set-Content -LiteralPath (Join-Path $a 'sub\b.txt') -Value ('y' * 300) -Encoding UTF8
+        $fp1 = Get-TreeFingerprint $a
+        if (-not (Move-ItemWithFallback -From $a -To $b)) { return 'Move-ItemWithFallback returned false' }
+        if (Test-Path -LiteralPath $a) { return 'the source folder is still there' }
+        $fp2 = Get-TreeFingerprint $b
+        if ([int]$fp2.Count -ne [int]$fp1.Count) { return 'the copy has a different file count' }
+        if ([long]$fp2.Bytes -ne [long]$fp1.Bytes) { return 'the copy has a different byte count' }
+        return $null
+    }
+
+    T 'reparse points are skipped, not followed' {
+        $t = Join-Path $tmpRoot 'rp_target'
+        $p = Join-Path $tmpRoot 'rp_parent'
+        New-Item -ItemType Directory -Path $t -Force | Out-Null
+        New-Item -ItemType Directory -Path $p -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $t 'keep.txt') -Value 'keep' -Encoding UTF8
+        Set-Content -LiteralPath (Join-Path $p 'trash.txt') -Value 'trash' -Encoding UTF8
+        $link = Join-Path $p 'link'
+        $made = $false
+        try {
+            New-Item -ItemType Junction -Path $link -Target $t -ErrorAction Stop | Out-Null
+            $made = $true
+        } catch { }
+        if (-not $made) { return $null }
+        $r = Remove-TreeSafely -Path $p
+        if (-not (Test-Path -LiteralPath (Join-Path $t 'keep.txt'))) { return 'the junction target was modified' }
+        if (Test-Path -LiteralPath (Join-Path $p 'trash.txt')) { return 'a regular file inside the folder was not deleted' }
+        return $null
+    }
+
+    T 'protected locations are refused' {
+        foreach ($bad in @('C:\Windows', 'C:\Windows\System32', ($env:SystemDrive + '\'), (Join-Path $env:SystemRoot 'System32\config'))) {
+            $r = Test-SafeLeftoverPath $bad
+            if ([bool]$r.Safe) { return ('accepted a protected path: ' + $bad) }
+        }
+        return $null
+    }
+
+    T 'registry branch safety' {
+        if ((Test-SafeRegistryPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run').Safe) { return 'Microsoft branch accepted' }
+        if ((Test-SafeRegistryPath 'HKLM:\SOFTWARE\Classes\CLSID').Safe) { return 'Classes branch accepted' }
+        if ((Test-SafeRegistryPath 'HKLM:\SOFTWARE\Policies\Contoso').Safe) { return 'Policies branch accepted' }
+        if ((Test-SafeRegistryPath 'HKCU:\Software').Safe) { return 'the Software root itself was accepted' }
+        $good = Test-SafeRegistryPath 'HKCU:\Software\STweakSelfTestVendor'
+        if (-not $good.Safe) { return ('a normal vendor key was refused: ' + [string]$good.Reason) }
+        return $null
+    }
+
+    T 'startup value safety' {
+        $a = Test-SafeRunValuePath 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run|Contoso'
+        if (-not $a.Safe) { return 'a normal Run value was refused' }
+        $b = Test-SafeRunValuePath 'HKCU:\Software\Contoso\Run|X'
+        if ($b.Safe) { return 'an unknown startup key was accepted' }
+        $c = Test-SafeRunValuePath 'no-separator'
+        if ($c.Safe) { return 'a malformed run value was accepted' }
+        return $null
+    }
+
+    T 'shortcut safety' {
+        $txt = Join-Path $tmpRoot 'note.txt'
+        Set-Content -LiteralPath $txt -Value 'x' -Encoding UTF8
+        if ((Test-SafeShortcutPath $txt).Safe) { return 'a non-shortcut was accepted' }
+        $lnk = Join-Path $tmpRoot 'outside.lnk'
+        try {
+            $ws = New-Object -ComObject WScript.Shell
+            $sc = $ws.CreateShortcut($lnk)
+            $sc.TargetPath = $txt
+            $sc.Save()
+            [System.Runtime.InteropServices.Marshal]::ReleaseComObject($ws) | Out-Null
+        } catch { }
+        if (Test-Path -LiteralPath $lnk) {
+            if ((Test-SafeShortcutPath $lnk).Safe) { return 'a shortcut outside Desktop/Start Menu was accepted' }
+        }
+        return $null
+    }
+
+    T 'Windows service names are refused' {
+        foreach ($n in @('WinDefend', 'MpsSvc', 'wuauserv', 'SecurityHealthService', 'WSearch')) {
+            if ((Test-SafeServiceName $n).Safe) { return ($n + ' was accepted') }
+        }
+        if (-not (Test-SafeServiceName 'ContosoAgent').Safe) { return 'a third-party service name was refused' }
+        return $null
+    }
+
+    T 'registry write and remove round trip' {
+        $k = 'HKCU:\Software\STweakSelfTest_' + $PID
+        if (Test-Path -LiteralPath $k) { Remove-Item -LiteralPath $k -Recurse -Force -ErrorAction SilentlyContinue }
+        New-Item -Path $k -Force | Out-Null
+        try {
+            Set-RegValueOrRemove -Path $k -Name 'Probe' -PrevState @{ Exists = $true; Value = 'probe-value'; Kind = 'String' } -FallbackType 'String'
+            $v = Get-ItemProperty -LiteralPath $k -Name 'Probe' -ErrorAction Stop
+            if ([string]$v.Probe -ne 'probe-value') { return 'the probe value was not written' }
+            Set-RegValueOrRemove -Path $k -Name 'Probe' -PrevState @{ Exists = $false } -FallbackType 'String'
+            $names = (Get-Item -LiteralPath $k).GetValueNames()
+            if (@($names) -contains 'Probe') { return 'the probe value was not removed' }
+        } finally {
+            if (Test-Path -LiteralPath $k) { Remove-Item -LiteralPath $k -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+        return $null
+    }
+
+    T 'winget table parser' {
+        $sample = @(
+            'Name                                Id                        Version      Available    Source',
+            '----------------------------------------------------------------------------------------------',
+            'Contoso Widget                      Contoso.Widget            1.2.3        1.3.0        winget',
+            'Fabrikam Tool                       Fabrikam.Tool             2.0.0                     winget'
+        ) -join "`r`n"
+        $rows = @(ConvertFrom-WingetTable $sample)
+        if ($rows.Count -ne 2) { return ('expected 2 rows, got ' + $rows.Count) }
+        if ([string]$rows[0].Id -ne 'Contoso.Widget') { return ('wrong first id: ' + [string]$rows[0].Id) }
+        if ([string]$rows[0].Available -ne '1.3.0') { return ('wrong available version: ' + [string]$rows[0].Available) }
+        if ([string]$rows[1].Id -ne 'Fabrikam.Tool') { return ('wrong second id: ' + [string]$rows[1].Id) }
+        return $null
+    }
+
+    T 'uninstaller commands are validated' {
+        $p1 = Get-UninstallerPolicy ('"' + $env:ComSpec + '" /c calc.exe')
+        if ($p1.Allowed) { return 'cmd.exe was allowed' }
+        $p2 = Get-UninstallerPolicy 'powershell.exe -File something.ps1'
+        if ($p2.Allowed) { return 'powershell.exe was allowed' }
+        $p3 = Get-UninstallerPolicy 'wscript.exe //B evil.vbs'
+        if ($p3.Allowed) { return 'wscript.exe was allowed' }
+        $p4 = Get-UninstallerPolicy ('"' + $env:SystemRoot + '\System32\stweak-not-a-real-uninstaller.exe" /S')
+        if ($p4.Allowed) { return 'a missing uninstaller was allowed' }
+        $fakeDir = Join-Path $env:ProgramData ('STweakSelfTest_' + $PID)
+        $fake = Join-Path $fakeDir 'unsigned-uninstaller.exe'
+        try {
+            New-Item -ItemType Directory -Path $fakeDir -Force -ErrorAction Stop | Out-Null
+            Set-Content -LiteralPath $fake -Value 'not a real program' -Encoding ASCII -ErrorAction Stop
+            $p6 = Get-UninstallerPolicy ('"' + $fake + '" /S')
+            if ($p6.Allowed) { return 'an unsigned uninstaller in a user-writable folder was allowed' }
+        } catch { } finally {
+            try { if (Test-Path -LiteralPath $fakeDir) { Remove-Item -LiteralPath $fakeDir -Recurse -Force -ErrorAction SilentlyContinue } } catch { }
+        }
+        $msi = Join-Path $env:WINDIR 'System32\msiexec.exe'
+        if (Test-Path -LiteralPath $msi) {
+            $p5 = Get-UninstallerPolicy ('"' + $msi + '" /X{00000000-0000-0000-0000-000000000000}')
+            if ($p5.Allowed) { return 'an MSI product that is not registered machine-wide was allowed' }
+            $real = $null
+            try {
+                $real = Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall' -ErrorAction SilentlyContinue |
+                    Where-Object { $_.PSChildName -match '^\{[0-9A-Fa-f-]{36}\}$' } | Select-Object -First 1
+            } catch { $real = $null }
+            if ($real) {
+                $p7 = Get-UninstallerPolicy ('"' + $msi + '" /X' + $real.PSChildName)
+                if (-not $p7.Allowed) { return ('a machine-wide MSI was refused: ' + [string]$p7.Reason) }
+            }
+        }
+        return $null
+    }
+
+    T 'data folder ACL blocks standard-user writes' {
+        $p = Join-Path $tmpRoot 'acl_probe'
+        New-Item -ItemType Directory -Path $p -Force | Out-Null
+        try {
+            if (-not (Set-RestrictedDataAcl -Path $p)) { return 'the ACL helper failed' }
+            $acl = Get-Acl -LiteralPath $p
+            $users = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')
+            foreach ($ace in $acl.Access) {
+                $sid = $null
+                try { $sid = $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]) } catch { $sid = $null }
+                if ($sid -and ($sid.Value -eq $users.Value)) {
+                    if (($ace.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::WriteData) -ne 0) { return 'Users still have write access' }
+                    if (($ace.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::CreateFiles) -ne 0) { return 'Users can still create files' }
+                }
+            }
+        } finally {
+            # Restore inheritance so the temporary folder can be removed at the end.
+            try { & icacls.exe $p /reset /T 2>&1 | Out-Null } catch { }
+        }
+        return $null
+    }
+
+    T 'Defender restore mapping' {
+        if ((Get-DefenderSettingRestore -Name 'PUA' -SavedValue 0) -ne 'Disabled') { return 'saved 0 did not map to Disabled' }
+        if ((Get-DefenderSettingRestore -Name 'PUA' -SavedValue 1) -ne 'None') { return 'saved 1 did not map to None' }
+        if ((Get-DefenderSettingRestore -Name 'PUA' -SavedValue 2) -ne 'AuditMode') { return 'saved 2 did not map to AuditMode' }
+        $threw = $false
+        try { $null = Get-DefenderSettingRestore -Name 'PUA' -SavedValue -1 } catch { $threw = $true }
+        if (-not $threw) { return 'an unknown saved value was accepted' }
+        if ((Get-DefenderSettingStatus -SavedValue 0) -ne 'NotApplied') { return 'status 0 is wrong' }
+        if ((Get-DefenderSettingStatus -SavedValue 1) -ne 'Applied') { return 'status 1 is wrong' }
+        if ((Get-DefenderSettingStatus -SavedValue 2) -ne 'Partial') { return 'status 2 is wrong' }
+        if ((Get-DefenderSettingStatus -SavedValue -1) -ne 'Unknown') { return 'status -1 is wrong' }
+        return $null
+    }
+
+    T 'hibernation restore needs the original hiberfil state' {
+        $src = Get-Content -LiteralPath $PSCommandPath -Raw
+        if ($src -notmatch 'HiberfilExists') { return 'the hibernation tweak does not record whether hiberfil.sys existed' }
+        return $null
+    }
+
+    T 'quarantine manifest and restore round trip' {
+        $manifestBackup = $null
+        if (Test-Path -LiteralPath $ManifestFile) { $manifestBackup = [System.IO.File]::ReadAllBytes($ManifestFile) }
+        $src = Join-Path $tmpRoot 'q_src'
+        New-Item -ItemType Directory -Path $src -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $src 'a.txt') -Value 'quarantine probe' -Encoding UTF8
+        $fp0 = Get-TreeFingerprint $src
+        try {
+            $qp = Move-PathToQuarantine -Path $src -App 'STweakSelfTest'
+            if (-not $qp) { return 'the folder was not moved to quarantine' }
+            if (Test-Path -LiteralPath $src) { return 'the source folder still exists' }
+            $e = Add-QuarantineEntry -App 'STweakSelfTest' -Type 'Folder' -OriginalPath $src -QuarantinePath $qp
+            $m = Get-QuarantineManifest
+            $found = $false
+            foreach ($x in @($m.entries)) { if ([int]$x.Id -eq [int]$e.Id) { $found = $true } }
+            if (-not $found) { return 'the new entry is missing from the manifest' }
+            if (-not (Move-ItemWithFallback -From $qp -To $src)) { return 'the restore move failed' }
+            $fp1 = Get-TreeFingerprint $src
+            if ([int]$fp1.Count -ne [int]$fp0.Count) { return 'the restored folder has a different file count' }
+            if ([long]$fp1.Bytes -ne [long]$fp0.Bytes) { return 'the restored folder has a different byte count' }
+        } finally {
+            try {
+                if ($null -eq $manifestBackup) {
+                    if (Test-Path -LiteralPath $ManifestFile) { Remove-Item -LiteralPath $ManifestFile -Force -ErrorAction SilentlyContinue }
+                } else {
+                    [System.IO.File]::WriteAllBytes($ManifestFile, $manifestBackup)
+                }
+            } catch { }
+        }
+        return $null
+    }
+
+    T 'quarantine payload paths are confined' {
+        if ((Test-QuarantinePayloadPath (Join-Path $env:SystemRoot 'notepad.exe')).Safe) { return 'a system file was accepted as a quarantine payload' }
+        if ((Test-QuarantinePayloadPath (Join-Path $tmpRoot 'nope.txt')).Safe) { return 'a temp file was accepted as a quarantine payload' }
+        if ((Test-QuarantinePayloadPath $QuarantineDir -AllowMissing).Safe) { return 'the quarantine folder itself was accepted as a payload' }
+        $ok = Test-QuarantinePayloadPath (Join-Path $QuarantineDir 'probe.txt') -AllowMissing
+        if (-not $ok.Safe) { return ('a path inside the quarantine folder was refused: ' + [string]$ok.Reason) }
+        return $null
+    }
+
+    T 'restore targets are confined' {
+        foreach ($bad in @('C:\Windows\System32\evil', 'C:\Windows', 'C:\')) {
+            if ((Test-SafeRestoreTarget -Type 'Folder' -Path $bad).Safe) { return ('accepted a protected restore target: ' + $bad) }
+        }
+        $good = Test-SafeRestoreTarget -Type 'Folder' -Path (Join-Path $env:LOCALAPPDATA 'STweakSelfTest_restore\app')
+        if (-not $good.Safe) { return ('refused a normal restore target: ' + [string]$good.Reason) }
+        if ((Test-SafeRestoreTarget -Type 'Task' -Path '\Microsoft\Windows\Evil').Safe) { return 'a Microsoft task path was accepted' }
+        if (-not (Test-SafeRestoreTarget -Type 'Task' -Path '\Contoso\Updater').Safe) { return 'a normal task path was refused' }
+        $startupLnk = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Startup\Contoso.lnk'
+        if (-not (Test-SafeRestoreTarget -Type 'Shortcut' -Path $startupLnk).Safe) { return 'a startup shortcut restore was refused' }
+        return $null
+    }
+
+    T 'registry restore targets are confined' {
+        foreach ($bad in @('HKLM:\SYSTEM\CurrentControlSet\Services\Evil', 'HKLM:\SOFTWARE\Classes\Evil', 'HKCU:\Software\Policies\Evil')) {
+            if ((Test-SafeRegistryRestoreTarget -Type 'RegistryKey' -Path $bad).Safe) { return ('accepted a protected registry target: ' + $bad) }
+        }
+        if (-not (Test-SafeRegistryRestoreTarget -Type 'RegistryKey' -Path 'HKCU:\Software\Contoso').Safe) { return 'a normal vendor key was refused' }
+        $u = Test-SafeRegistryRestoreTarget -Type 'UninstallEntry' -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Contoso'
+        if (-not $u.Safe) { return ('a normal uninstall entry was refused: ' + [string]$u.Reason) }
+        $rv = Test-SafeRegistryRestoreTarget -Type 'RunValue' -Path 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run|Contoso'
+        if (-not $rv.Safe) { return 'a normal startup value was refused' }
+        return $null
+    }
+
+    T 'registry backups cannot write outside their key' {
+        $a = Join-Path $tmpRoot 'good.reg'
+        Set-Content -LiteralPath $a -Value "@`r`n[HKEY_CURRENT_USER\Software\ContosoProbe]`r`n`"X`"=`"1`"" -Encoding Unicode
+        $g = Test-RegFileMatchesKey -RegFile $a -KeyPath 'HKCU:\Software\ContosoProbe'
+        if (-not $g.Safe) { return ('a matching backup was refused: ' + [string]$g.Reason) }
+        $b = Join-Path $tmpRoot 'bad.reg'
+        Set-Content -LiteralPath $b -Value "@`r`n[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Evil]`r`n`"X`"=`"1`"" -Encoding Unicode
+        if ((Test-RegFileMatchesKey -RegFile $b -KeyPath 'HKCU:\Software\ContosoProbe').Safe) { return 'a backup that writes elsewhere was accepted' }
+        return $null
+    }
+
+    T 'fingerprints and restore guards ignore junctions' {
+        $t = Join-Path $tmpRoot 'fp_link_target'
+        $p = Join-Path $tmpRoot 'fp_link_parent'
+        New-Item -ItemType Directory -Path $t -Force | Out-Null
+        New-Item -ItemType Directory -Path $p -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $p 'local.txt') -Value 'local' -Encoding UTF8
+        foreach ($i in 1..3) { Set-Content -LiteralPath (Join-Path $t ('x' + $i + '.txt')) -Value ('x' * 100) -Encoding UTF8 }
+        $link = Join-Path $p 'link'
+        try { New-Item -ItemType Junction -Path $link -Target $t -ErrorAction Stop | Out-Null } catch { return $null }
+        try {
+            $fp = Get-TreeFingerprint $p
+            if ([int]$fp.Count -ne 1) { return ('the fingerprint followed a junction (files: ' + $fp.Count + ')') }
+            if ((Test-SafeRestoreTarget -Type 'Folder' -Path (Join-Path $p 'link\files')).Safe) { return 'a restore path below a junction was accepted' }
+        } finally {
+            try { if (Test-Path -LiteralPath $link) { (Get-Item -LiteralPath $link -Force).Delete() } } catch { }
+        }
+        return $null
+    }
+
+    T 'tampered quarantine entries cannot delete or restore outside it' {
+        $manifestBackup = $null
+        if (Test-Path -LiteralPath $ManifestFile) { $manifestBackup = [System.IO.File]::ReadAllBytes($ManifestFile) }
+        try {
+            $m = Get-QuarantineManifest
+            $id = [int]$m.nextId
+            $m.entries = @($m.entries) + @([PSCustomObject]@{
+                Id = $id; App = 'STweakSelfTest'; Type = 'Folder'
+                OriginalPath = (Join-Path $env:LOCALAPPDATA 'STweakSelfTest_tamper')
+                QuarantinePath = $env:SystemRoot; Created = (Get-Date).ToString('s'); Restored = $false
+            })
+            $m.nextId = $id + 1
+            Save-QuarantineManifest $m
+            if (-not (Test-Path -LiteralPath $ManifestFile)) { return 'the manifest was not written' }
+            if (Test-Path -LiteralPath ($ManifestFile + '.tmp')) { return 'a temporary manifest file was left behind' }
+            $r = Restore-QuarantineEntry -Entry ([PSCustomObject]@{ Id = $id })
+            if ($r.Success) { return 'the restore accepted a payload outside the quarantine folder' }
+            $d = Remove-QuarantineEntry -Entry ([PSCustomObject]@{ Id = $id })
+            if ($d.Success) { return 'the delete accepted a path outside the quarantine folder' }
+        } finally {
+            try {
+                if ($null -eq $manifestBackup) {
+                    if (Test-Path -LiteralPath $ManifestFile) { Remove-Item -LiteralPath $ManifestFile -Force -ErrorAction SilentlyContinue }
+                } else {
+                    [System.IO.File]::WriteAllBytes($ManifestFile, $manifestBackup)
+                }
+            } catch { }
+        }
+        return $null
+    }
+
+    T 'existing Windows services are refused by binary location' {
+        $svc = $null
+        try {
+            $svc = Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue |
+                Where-Object { $_.PathName -and ($_.PathName -match '(?i)system32') -and ($_.Name -notmatch '(?i)^(win|ms|wdi|wd|sec|trusted|event|schedule|rpc|dcom|power|themes|audio|dhcp|dns|lanman|spooler|bits|wuauserv|mpssvc|windefend|securityhealth|sense|nissrv|wsearch)') } |
+                Select-Object -First 1
+        } catch { $svc = $null }
+        if (-not $svc) { return $null }
+        if ((Test-SafeServiceName ([string]$svc.Name)).Safe) { return ('accepted ' + [string]$svc.Name + ' with a System32 binary') }
+        return $null
+    }
+
+    T 'background watchdog has a timeout and queue' {
+        $src = Get-Content -LiteralPath $PSCommandPath -Raw
+        if ($src -notmatch 'BgDeadline') { return 'Update-BgTick has no deadline' }
+        if ($src -notmatch 'BgPending') { return 'there is no pending-operation queue' }
+        if ($src -notmatch "State = 'TimedOut'") { return 'there is no TimedOut state' }
+        return $null
+    }
+
+    T 'cleanup refuses to mix the Recycle Bin with other targets' {
+        $src = Get-Content -LiteralPath $PSCommandPath -Raw
+        if ($src -notmatch 'cannot be emptied together with other locations') { return 'the Recycle Bin merge guard is missing' }
+        return $null
+    }
+
+    T 'log rotation is in place' {
+        $src = Get-Content -LiteralPath $PSCommandPath -Raw
+        if ($src -notmatch "TextLogFile \+ '\.1'") { return 'the log file is not rotated' }
+        return $null
+    }
+
+    $wingetPath = Get-WingetExePath
+    Write-Host ''
+    if ($wingetPath) { Write-Host ('INFO: winget detected at ' + $wingetPath) }
+    else { Write-Host 'INFO: winget was not found; the app catalogue will stay read-only.' }
+
+    # Tidy up: junctions are skipped by Remove-TreeSafely, so unlink them first.
+    try {
+        $rpLink = Join-Path $tmpRoot 'rp_parent\link'
+        if (Test-Path -LiteralPath $rpLink) { (Get-Item -LiteralPath $rpLink -Force).Delete() }
+    } catch { }
+    try { if (Test-Path -LiteralPath $tmpRoot) { $null = Remove-TreeSafely -Path $tmpRoot } } catch { }
+    try { if (Test-Path -LiteralPath $tmpRoot) { Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue } } catch { }
+    Remove-TempStateIfAny
+
+    Write-Host ''
+    if ($script:SelfFails.Count -eq 0) {
+        Write-Host ('SELFTEST OK (' + $script:SelfPass + ' checks passed)')
+        exit 0
+    }
+    foreach ($f in $script:SelfFails) { Write-Host ('FAIL: ' + $f) }
+    Write-Host ('SELFTEST FAILED (' + $script:SelfFails.Count + ' failed, ' + $script:SelfPass + ' passed)')
     exit 1
 }
 
